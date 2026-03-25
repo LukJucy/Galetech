@@ -92,7 +92,10 @@ class GaletechAssetOptimizer:
             T = len(day['elec_load'])
             p_ch, p_dis, soc = cp.Variable(T, nonneg=True), cp.Variable(T, nonneg=True), cp.Variable(T, nonneg=True)
             p_btm_supply, p_gas_replaced, p_grid_sell = cp.Variable(T, nonneg=True), cp.Variable(T, nonneg=True), cp.Variable(T, nonneg=True)
-            p_curtail = cp.Variable(T, nonneg=True) 
+            p_grid_buy = cp.Variable(T, nonneg=True)  # Grid purchase (backup power)
+            p_curtail = cp.Variable(T, nonneg=True)
+            # Battery mutual exclusion variables (z[t]=1 for discharging, z[t]=0 for charging)
+            z_bess = cp.Variable(T, nonneg=True) if b_mwh > 0 else None
             
             p_wind = np.zeros(T)
             if t_model in self.wind_solar_ref_data and t_model != "None":
@@ -102,33 +105,68 @@ class GaletechAssetOptimizer:
             if 'solar_per_mw' in self.wind_solar_ref_data and s_mw > 0:
                 p_solar = self.wind_solar_ref_data['solar_per_mw'] * s_mw * self.params['solar_efficiency']  # kW per MW * capacity * efficiency
             
+            # Define grid purchase upper limit (contractual grid capacity, default 80% of export limit)
+            grid_buy_limit_kw = export_limit_kw * 0.8
+            
+            # Grid mutual exclusion variable (z_grid[t]=1 for selling, z_grid[t]=0 for buying)
+            z_grid = cp.Variable(T, nonneg=True)
+            
             constraints = [
-                p_wind + p_solar + p_dis == p_btm_supply + p_grid_sell + p_ch + p_curtail,
-                p_btm_supply <= day['elec_load'] + p_gas_replaced,
+                # Energy balance: supply = demand (electricity equivalent including heat converted to electricity)
+                p_wind + p_solar + p_dis + p_grid_buy == p_btm_supply + p_grid_sell + p_ch + p_curtail,
+                # Must satisfy customer loads: total supply must cover electricity and gas loads
+                p_btm_supply >= day['elec_load'] + p_gas_replaced,
+                # Gas replacement constraints
+                p_gas_replaced >= day['gas_load'],
                 p_gas_replaced <= day['gas_load'],
-                p_grid_sell <= export_limit_kw 
+                # Grid constraints
+                p_grid_sell <= export_limit_kw,
+                p_grid_buy <= grid_buy_limit_kw,
+                # Grid mutual exclusion: cannot buy and sell simultaneously (Big-M formulation)
+                p_grid_sell <= export_limit_kw * z_grid,
+                p_grid_buy <= grid_buy_limit_kw * (1 - z_grid),
+                # Binary constraint for grid mode (selling or buying)
+                z_grid >= 0,
+                z_grid <= 1,
+                # Renewable curtailment constraint: curtailment cannot exceed available generation
+                p_curtail <= p_wind + p_solar
             ]
             
             if b_mwh > 0:
                 cap_kwh = b_mwh * 1000
                 constraints += [
-                    soc <= cap_kwh * 0.9, soc >= cap_kwh * 0.1,
-                    soc[0] == cap_kwh * 0.5, soc[T-1] == cap_kwh * 0.5,
-                    p_ch <= bess_max_power_kw, p_dis <= bess_max_power_kw
+                    # SOC constraints
+                    soc <= cap_kwh * 0.9,
+                    soc >= cap_kwh * 0.1,
+                    soc[0] == cap_kwh * 0.5,
+                    soc[T-1] == cap_kwh * 0.5,
+                    # Battery power constraints
+                    p_ch <= bess_max_power_kw,
+                    p_dis <= bess_max_power_kw,
+                    # Battery mutual exclusion: cannot charge and discharge simultaneously (Big-M formulation)
+                    p_ch <= bess_max_power_kw * (1 - z_bess),
+                    p_dis <= bess_max_power_kw * z_bess,
+                    # z_bess=1: discharging mode, z_bess=0: charging mode
+                    # Binary constraint for battery mode
+                    z_bess >= 0,
+                    z_bess <= 1
                 ]
-                for t in range(1, T): constraints.append(soc[t] == soc[t-1] + p_ch[t]*self.bess_eff - p_dis[t]/self.bess_eff)
+                for t in range(1, T): 
+                    constraints.append(soc[t] == soc[t-1] + p_ch[t]*self.bess_eff - p_dis[t]/self.bess_eff)
             else:
                 constraints += [p_ch == 0, p_dis == 0, soc == 0]
 
             rev_customer = cp.sum(p_btm_supply * (self.params['p_galetech'] * ppa_shock))
             rev_grid = cp.sum(p_grid_sell * self.params['p_sell'])
             val_carbon = cp.sum(p_gas_replaced * carbon_premium)
+            # Grid purchase cost (assume 80% of sell price as wholesale rate)
+            grid_purchase_cost = cp.sum(p_grid_buy * (self.params['p_sell'] * 0.8))
             
-            obj = cp.Maximize(rev_customer + rev_grid + val_carbon - cp.sum(p_dis * bess_wear_cost))
+            obj = cp.Maximize(rev_customer + rev_grid + val_carbon - grid_purchase_cost - cp.sum(p_dis * bess_wear_cost))
             prob = cp.Problem(obj, constraints)
             
             try:
-                prob.solve(solver=cp.OSQP)
+                prob.solve(solver=cp.GUROBI)
                 if prob.status not in ["infeasible", "unbounded"]:
                     annual_revenue += prob.value * day['weight']
                     annual_co2_saved += np.sum(p_gas_replaced.value) * self.gas_carbon_factor / 1000 * day['weight']
@@ -212,20 +250,41 @@ def load_custom_typical_days(df=None, custom_weights=None):
 
 def load_wind_solar_ref_data():
     """
-    加载风光发电参考数据（从模型内置）。
-    基于 Typical_Daily_Power_Profile_2019.xlsx 中的实际数据。
+    Load wind and solar power reference data from CSV file.
+    The CSV file contains hourly power outputs per turbine model and per MW of solar.
     """
-    # 实际数据应该从Excel中读取，这里用示例数据
-    # 在实际应用中，可以让管理员上传此文件给模型配置
-    ref_data = {
-        "EWT 500kW": np.array([0]*24) * 0.5 / 1.0,  # 每台kW输出
-        "EWT 1MW": np.array([0]*24),
-        "E82 2.3MW": np.array([0]*24) * 2.3,
-        "V90 3MW": np.array([1022.7, 1033.8, 1031.4, 1046.0, 1043.8, 1031.1, 1028.1, 1030.9, 1011.6, 976.9, 985.9, 973.6, 975.1, 962.9, 961.9, 963.9, 946.2, 954.3, 918.2, 935.9, 939.9, 965.5, 975.9, 1007.9]),  # 根据提供的数据
-        "E115 4.2MW": np.array([0]*24) * 4.2,
-        "E138 4.26MW": np.array([0]*24) * 4.26,
-        "solar_per_mw": np.array([0, 0, 0, 0, 19.9, 96.0, 239.7, 448.4, 706.3, 979.5, 1203.2, 1333.4, 1348.4, 1245.7, 1042.3, 775.5, 509.0, 286.2, 125.5, 32.9, 0, 0, 0, 0])  # 根据提供的数据
-    }
+    import os
+    csv_path = os.path.join(os.path.dirname(__file__), 'Typical_Daily_Power_Profile_2019.csv')
+    
+    ref_data = {}
+    
+    try:
+        # Read the CSV file with wind turbine hourly outputs
+        df = pd.read_csv(csv_path)
+        
+        # Extract turbine columns (skip the 'Hour' column)
+        turbine_models = [col for col in df.columns if col != 'Hour']
+        
+        for model in turbine_models:
+            ref_data[model] = df[model].values
+            
+        # Add solar reference data (kW per MW at each hour)
+        # This is based on typical 1MW PV system output profile
+        ref_data['solar_per_mw'] = np.array([0, 0, 0, 0, 19.9, 96.0, 239.7, 448.4, 706.3, 979.5, 1203.2, 1333.4, 1348.4, 1245.7, 1042.3, 775.5, 509.0, 286.2, 125.5, 32.9, 0, 0, 0, 0])
+        
+    except FileNotFoundError:
+        st.warning(f"Reference data file not found: {csv_path}. Using default values.")
+        # Fallback to default data if CSV not found
+        ref_data = {
+            "V90 3MW": np.array([1022.742384, 1033.757863, 1031.353288, 1046.004247, 1043.791562, 1031.096, 1028.068603, 1030.901151, 1011.62874, 976.9499452, 985.9115342, 973.6334521, 975.104274, 962.8912877, 961.9958356, 963.9593973, 946.1557808, 954.2829863, 918.2227123, 935.9376438, 939.8587671, 965.5370685, 975.8890137, 1007.926795]),
+            "EWT 500kW": np.array([170.457064, 172.2929772, 171.8922147, 174.3340412, 173.9652603, 171.8493333, 171.3447672, 171.8168585, 168.60479, 162.8249909, 164.318589, 162.272242, 162.517379, 160.4818813, 160.3326393, 160.6598996, 157.6926301, 159.0471644, 153.0371187, 155.9896073, 156.6431279, 160.9228448, 162.648169, 167.9877992]),
+            "E82 2.3MW": np.array([784.1024944, 792.547695, 790.7041875, 801.9365894, 800.2401975, 790.5069333, 788.185929, 790.3575491, 775.582034, 748.994958, 755.8655096, 746.4523133, 747.5799434, 738.2166539, 737.5301406, 739.0355379, 725.3860986, 731.6169562, 703.9707461, 717.5521936, 720.5583881, 740.2450859, 748.1815772, 772.7438762]),
+            "E138 4.26MW": np.array([1452.294185, 1467.936165, 1464.521669, 1485.326031, 1482.184018, 1464.15632, 1459.857416, 1463.879634, 1436.512811, 1387.268922, 1399.994379, 1382.559502, 1384.648069, 1367.305629, 1366.034087, 1368.822344, 1343.541209, 1355.081841, 1303.876251, 1329.031454, 1334.599449, 1371.062637, 1385.762399, 1431.256049]),
+            "EWT 1MW": np.array([340.914128, 344.5859543, 343.7844293, 348.6680823, 347.9305207, 343.6986667, 342.6895343, 343.633717, 337.20958, 325.6499817, 328.6371781, 324.544484, 325.034758, 320.9637626, 320.6652785, 321.3197991, 315.3852603, 318.0943288, 306.0742374, 311.9792146, 313.2862557, 321.8456895, 325.2963379, 335.9755983]),
+            "E115 4.2MW": np.array([1431.839338, 1447.261008, 1443.894603, 1464.405946, 1461.308187, 1443.5344, 1439.296044, 1443.261611, 1416.280236, 1367.729923, 1380.276148, 1363.086833, 1365.145984, 1348.047803, 1346.79417, 1349.543156, 1324.618093, 1335.996181, 1285.511797, 1310.312701, 1315.802274, 1351.751896, 1366.244619, 1411.097513]),
+            "solar_per_mw": np.array([0, 0, 0, 0, 19.9, 96.0, 239.7, 448.4, 706.3, 979.5, 1203.2, 1333.4, 1348.4, 1245.7, 1042.3, 775.5, 509.0, 286.2, 125.5, 32.9, 0, 0, 0, 0])
+        }
+    
     return ref_data
 
 # ==========================================
@@ -236,7 +295,8 @@ st.title("📑 Galetech BOO Optimiser & Bankability Assistant")
 
 with st.sidebar:
     st.header("📂 Data & Profile Setup")
-    uploaded_file = st.file_uploader("Upload Customer Hourly Load Profile (CSV/Excel: elec_load, gas_load per hour, multiples of 24 rows)", type=['csv', 'xlsx'])
+    st.info("ℹ️ Wind & Solar output data are embedded in the model. Please only upload hourly electricity and gas load profiles.")
+    uploaded_file = st.file_uploader("Upload Customer Hourly Load Profile (CSV/Excel with columns: elec_load, gas_load; one row per hour)", type=['csv', 'xlsx'])
     df_customer = None
     custom_weights = []
     if uploaded_file is not None:
