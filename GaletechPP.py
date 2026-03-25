@@ -93,17 +93,15 @@ class GaletechAssetOptimizer:
         all_traces = []
 
         for day_idx, day in enumerate(rep_days):
-            T = len(day['wind_speed'])
+            T = len(day['elec_load'])
             p_ch, p_dis, soc = cp.Variable(T, nonneg=True), cp.Variable(T, nonneg=True), cp.Variable(T, nonneg=True)
             p_btm_elec = cp.Variable(T, nonneg=True) 
             p_gas_replaced = cp.Variable(T, nonneg=True) 
             p_grid_sell = cp.Variable(T, nonneg=True) 
             p_curtail = cp.Variable(T, nonneg=True) 
             
-            p_wind = self.get_wind_power(day['wind_speed'], t_model, t_count, wind_shock)
-            # 兼容输入：如果数据是 W/m² 则转换为 kW/m²；如果是 0-1 区间（kW/m²）直接使用
-            irrad_kw_m2 = day['solar_irrad'] * 0.001 if np.max(day['solar_irrad']) > 10 else day['solar_irrad']
-            p_solar = s_mw * 1000 * irrad_kw_m2 * self.params['solar_efficiency']  # p_solar unit: kW
+            p_wind = day['wind_powers'].get(t_model, np.zeros(24)) * t_count
+            p_solar = s_mw * day['solar_power_per_mw'] # day['solar_power_per_mw'] is kW output for 1MW solar, s_mw in MW
             
             constraints = [
                 p_wind + p_solar + p_dis == p_btm_elec + p_gas_replaced + p_grid_sell + p_ch + p_curtail,
@@ -167,20 +165,49 @@ def load_custom_typical_days(df=None, custom_weights=None):
         num_days = len(df) // 24
         for i in range(num_days):
             day_data = df.iloc[i*24 : (i+1)*24]
+            # 风机列：除了Hour, elec_load, gas_load, 1MW installed Solar PV外的列
+            wind_cols = [col for col in df.columns if col not in ['Hour', 'elec_load', 'gas_load', '1MW installed Solar PV'] and 'Solar' not in col]
             rep_days.append({
-                'wind_speed': day_data['wind_speed'].values, 'solar_irrad': day_data['solar_irrad'].values,
-                'elec_load': day_data['elec_load'].values, 'gas_load': day_data['gas_load'].values,
+                'elec_load': day_data['elec_load'].values if 'elec_load' in day_data.columns else np.zeros(24),
+                'gas_load': day_data['gas_load'].values if 'gas_load' in day_data.columns else np.zeros(24),
+                'wind_powers': {col: day_data[col].values for col in wind_cols},
+                'solar_power_per_mw': day_data['1MW installed Solar PV'].values if '1MW installed Solar PV' in day_data.columns else np.zeros(24),
                 'weight': custom_weights[i] if custom_weights else 365/num_days
             })
     else:
         weights = custom_weights if custom_weights else [90, 90, 185]
         t = np.arange(24)
-        rep_days.append({'wind_speed': np.clip(3 + 2*np.sin(t/4), 0, None), 'solar_irrad': np.clip(np.sin((t-6)*np.pi/12), 0, 1) * 1.0,  # solar_irrad in kW/m² (absolute irradiance)
-                          'elec_load': 1200 + 400*np.sin((t-8)*np.pi/12), 'gas_load': 200 + 50*np.random.rand(24), 'weight': weights[0] if len(weights)>0 else 90})
-        rep_days.append({'wind_speed': np.clip(8 + 3*np.cos(t/4), 0, None), 'solar_irrad': np.clip(0.4 * np.sin((t-8)*np.pi/8), 0, 1) * 1.0,  # solar_irrad in kW/m² (absolute irradiance)
-                          'elec_load': 800 + 200*np.sin((t-6)*np.pi/12), 'gas_load': 2000 + 800*np.cos((t-12)*np.pi/12), 'weight': weights[1] if len(weights)>1 else 90})
-        rep_days.append({'wind_speed': np.clip(5 + 2*np.sin(t/6), 0, None), 'solar_irrad': np.clip(0.7 * np.sin((t-6)*np.pi/12), 0, 1) * 1.0,  # solar_irrad in kW/m² (absolute irradiance)
-                          'elec_load': 900 + 150*np.sin(t/4), 'gas_load': 600 + 100*np.random.rand(24), 'weight': weights[2] if len(weights)>2 else 185})
+        # 默认数据：保持elec_load和gas_load，wind_powers为模拟，solar_power_per_mw为模拟
+        default_wind_powers = {
+            "EWT 500kW": np.clip(3 + 2*np.sin(t/4), 0, None) * 500,  # 模拟kW输出
+            "EWT 1MW": np.clip(3 + 2*np.sin(t/4), 0, None) * 1000,
+            "E82 2.3MW": np.clip(8 + 3*np.cos(t/4), 0, None) * 2300,
+            "V90 3MW": np.clip(8 + 3*np.cos(t/4), 0, None) * 3000,
+            "E115 4.2MW": np.clip(5 + 2*np.sin(t/6), 0, None) * 4200,
+            "E138 4.26MW": np.clip(5 + 2*np.sin(t/6), 0, None) * 4260
+        }
+        default_solar = np.clip(np.sin((t-6)*np.pi/12), 0, 1) * 1000  # 1MW光伏的kW输出
+        rep_days.append({
+            'elec_load': 1200 + 400*np.sin((t-8)*np.pi/12), 
+            'gas_load': 200 + 50*np.random.rand(24), 
+            'wind_powers': default_wind_powers, 
+            'solar_power_per_mw': default_solar, 
+            'weight': weights[0] if len(weights)>0 else 90
+        })
+        rep_days.append({
+            'elec_load': 800 + 200*np.sin((t-6)*np.pi/12), 
+            'gas_load': 2000 + 800*np.cos((t-12)*np.pi/12), 
+            'wind_powers': default_wind_powers, 
+            'solar_power_per_mw': default_solar * 0.4, 
+            'weight': weights[1] if len(weights)>1 else 90
+        })
+        rep_days.append({
+            'elec_load': 900 + 150*np.sin(t/4), 
+            'gas_load': 600 + 100*np.random.rand(24), 
+            'wind_powers': default_wind_powers, 
+            'solar_power_per_mw': default_solar * 0.7, 
+            'weight': weights[2] if len(weights)>2 else 185
+        })
     return rep_days
 
 # ==========================================
