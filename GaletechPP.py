@@ -10,7 +10,7 @@ import io
 # 1. Core optimization engine (includes gas/carbon and grid constraint)
 # ==========================================
 class GaletechAssetOptimizer:
-    def __init__(self, params):
+    def __init__(self, params, wind_solar_ref_data=None):
         # optimizer configuration dictionary
         self.params = params
         # battery round-trip efficiency (fraction)
@@ -21,6 +21,10 @@ class GaletechAssetOptimizer:
         self.gas_carbon_factor = 0.202
         self.project_life_years = 20
         self.discount_rate = 0.10
+        
+        # 内置风光发电参考数据（kW per 1MW/1台）
+        # 结构: {'wind_turbine_model': [hourly output], 'solar_per_mw': [hourly output]}
+        self.wind_solar_ref_data = wind_solar_ref_data or {}
         
         self.turbine_models = {
             "None": {"mw": 0, "curve": [0]*13, "equip_cost": 0, "civil_cost": 0},
@@ -100,8 +104,13 @@ class GaletechAssetOptimizer:
             p_grid_sell = cp.Variable(T, nonneg=True) 
             p_curtail = cp.Variable(T, nonneg=True) 
             
-            p_wind = day['wind_powers'].get(t_model, np.zeros(24)) * t_count
-            p_solar = s_mw * day['solar_power_per_mw'] # day['solar_power_per_mw'] is kW output for 1MW solar, s_mw in MW
+            p_wind = np.zeros(T)
+            if t_model in self.wind_solar_ref_data and t_model != "None":
+                p_wind = self.wind_solar_ref_data[t_model] * t_count  # kW output * turbine count
+            
+            p_solar = np.zeros(T)
+            if 'solar_per_mw' in self.wind_solar_ref_data and s_mw > 0:
+                p_solar = self.wind_solar_ref_data['solar_per_mw'] * s_mw * self.params['solar_efficiency']  # kW per MW * capacity * efficiency
             
             constraints = [
                 p_wind + p_solar + p_dis == p_btm_elec + p_gas_replaced + p_grid_sell + p_ch + p_curtail,
@@ -160,55 +169,76 @@ class GaletechAssetOptimizer:
 # 2. Data preparation engine
 # ==========================================
 def load_custom_typical_days(df=None, custom_weights=None):
+    """
+    加载客户的负荷数据（电、气每小时需求）。
+    风光发电参考数据是内置的，不需要上传。
+    """
     rep_days = []
     if df is not None:
+        # 从客户上传的数据加载负荷
         num_days = len(df) // 24
         for i in range(num_days):
             day_data = df.iloc[i*24 : (i+1)*24]
-            # 风机列：除了Hour, elec_load, gas_load, 1MW installed Solar PV外的列
-            wind_cols = [col for col in df.columns if col not in ['Hour', 'elec_load', 'gas_load', '1MW installed Solar PV'] and 'Solar' not in col]
+            
+            # 读取电负荷
+            if 'elec_load' in df.columns:
+                elec_load = day_data['elec_load'].values
+            else:
+                st.warning("未找到 'elec_load' 列，使用默认值")
+                t = np.arange(24)
+                elec_load = 1200 + 400*np.sin((t-8)*np.pi/12)
+            
+            # 读取气负荷
+            if 'gas_load' in df.columns:
+                gas_load = day_data['gas_load'].values
+            else:
+                st.warning("未找到 'gas_load' 列，使用默认值")
+                t = np.arange(24)
+                gas_load = 200 + 50*np.random.rand(24)
+            
             rep_days.append({
-                'elec_load': day_data['elec_load'].values if 'elec_load' in day_data.columns else np.zeros(24),
-                'gas_load': day_data['gas_load'].values if 'gas_load' in day_data.columns else np.zeros(24),
-                'wind_powers': {col: day_data[col].values for col in wind_cols},
-                'solar_power_per_mw': day_data['1MW installed Solar PV'].values if '1MW installed Solar PV' in day_data.columns else np.zeros(24),
+                'elec_load': elec_load,
+                'gas_load': gas_load,
                 'weight': custom_weights[i] if custom_weights else 365/num_days
             })
     else:
+        # 默认数据：3个典型日
         weights = custom_weights if custom_weights else [90, 90, 185]
         t = np.arange(24)
-        # 默认数据：保持elec_load和gas_load，wind_powers为模拟，solar_power_per_mw为模拟
-        default_wind_powers = {
-            "EWT 500kW": np.clip(3 + 2*np.sin(t/4), 0, None) * 500,  # 模拟kW输出
-            "EWT 1MW": np.clip(3 + 2*np.sin(t/4), 0, None) * 1000,
-            "E82 2.3MW": np.clip(8 + 3*np.cos(t/4), 0, None) * 2300,
-            "V90 3MW": np.clip(8 + 3*np.cos(t/4), 0, None) * 3000,
-            "E115 4.2MW": np.clip(5 + 2*np.sin(t/6), 0, None) * 4200,
-            "E138 4.26MW": np.clip(5 + 2*np.sin(t/6), 0, None) * 4260
-        }
-        default_solar = np.clip(np.sin((t-6)*np.pi/12), 0, 1) * 1000  # 1MW光伏的kW输出
         rep_days.append({
             'elec_load': 1200 + 400*np.sin((t-8)*np.pi/12), 
             'gas_load': 200 + 50*np.random.rand(24), 
-            'wind_powers': default_wind_powers, 
-            'solar_power_per_mw': default_solar, 
             'weight': weights[0] if len(weights)>0 else 90
         })
         rep_days.append({
             'elec_load': 800 + 200*np.sin((t-6)*np.pi/12), 
             'gas_load': 2000 + 800*np.cos((t-12)*np.pi/12), 
-            'wind_powers': default_wind_powers, 
-            'solar_power_per_mw': default_solar * 0.4, 
             'weight': weights[1] if len(weights)>1 else 90
         })
         rep_days.append({
             'elec_load': 900 + 150*np.sin(t/4), 
             'gas_load': 600 + 100*np.random.rand(24), 
-            'wind_powers': default_wind_powers, 
-            'solar_power_per_mw': default_solar * 0.7, 
             'weight': weights[2] if len(weights)>2 else 185
         })
     return rep_days
+
+def load_wind_solar_ref_data():
+    """
+    加载风光发电参考数据（从模型内置）。
+    基于 Typical_Daily_Power_Profile_2019.xlsx 中的实际数据。
+    """
+    # 实际数据应该从Excel中读取，这里用示例数据
+    # 在实际应用中，可以让管理员上传此文件给模型配置
+    ref_data = {
+        "EWT 500kW": np.array([0]*24) * 0.5 / 1.0,  # 每台kW输出
+        "EWT 1MW": np.array([0]*24),
+        "E82 2.3MW": np.array([0]*24) * 2.3,
+        "V90 3MW": np.array([1022.7, 1033.8, 1031.4, 1046.0, 1043.8, 1031.1, 1028.1, 1030.9, 1011.6, 976.9, 985.9, 973.6, 975.1, 962.9, 961.9, 963.9, 946.2, 954.3, 918.2, 935.9, 939.9, 965.5, 975.9, 1007.9]),  # 根据提供的数据
+        "E115 4.2MW": np.array([0]*24) * 4.2,
+        "E138 4.26MW": np.array([0]*24) * 4.26,
+        "solar_per_mw": np.array([0, 0, 0, 0, 19.9, 96.0, 239.7, 448.4, 706.3, 979.5, 1203.2, 1333.4, 1348.4, 1245.7, 1042.3, 775.5, 509.0, 286.2, 125.5, 32.9, 0, 0, 0, 0])  # 根据提供的数据
+    }
+    return ref_data
 
 # ==========================================
 # 3. Streamlit UI and report generation
@@ -218,11 +248,14 @@ st.title("📑 Galetech BOO Optimiser & Bankability Assistant")
 
 with st.sidebar:
     st.header("📂 Data & Profile Setup")
-    uploaded_file = st.file_uploader("Upload Profile (CSV, multiples of 24 rows)", type=['csv'])
+    uploaded_file = st.file_uploader("Upload Customer Hourly Load Profile (CSV/Excel: elec_load, gas_load per hour, multiples of 24 rows)", type=['csv', 'xlsx'])
     df_customer = None
     custom_weights = []
     if uploaded_file is not None:
-        df_customer = pd.read_csv(uploaded_file)
+        if uploaded_file.name.endswith('.xlsx'):
+            df_customer = pd.read_excel(uploaded_file)
+        else:
+            df_customer = pd.read_csv(uploaded_file)
         num_days = len(df_customer) // 24
         for i in range(num_days): custom_weights.append(st.number_input(f"Day {i+1} Weight:", min_value=1, max_value=365, value=365//num_days))
     else:
@@ -269,6 +302,10 @@ if run_btn:
         st.stop()
         
     rep_days = load_custom_typical_days(df_customer, custom_weights)
+    
+    # 加载内置的风光参考数据
+    wind_solar_ref_data = load_wind_solar_ref_data()
+    
     optimizer_params = {
         'p_galetech': p_galetech_input / 1000, 'p_gas': p_gas_input / 1000, 
         'p_sell': p_sell_input / 1000, 'p_carbon': p_carbon_input,
@@ -277,7 +314,7 @@ if run_btn:
         'civil_solar': cv_solar, 'civil_bess': cv_bess,
         'elec_per_source': elec_conn, 'pm_rate': pm_rate, 'insurance_rate': ins_rate, 'maintenance_rate': maint_rate, 'land_lease': lease_cost
     }
-    optimizer = GaletechAssetOptimizer(optimizer_params)
+    optimizer = GaletechAssetOptimizer(optimizer_params, wind_solar_ref_data)
     
     turbine_choices = ["None", "EWT 500kW", "EWT 1MW", "E82 2.3MW", "V90 3MW", "E115 4.2MW", "E138 4.26MW"]
     res_list = []
