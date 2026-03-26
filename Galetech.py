@@ -811,160 +811,191 @@ if preview_btn:
 # ==========================================
 # 4. Run optimisation and display results
 # ==========================================
-if run_btn:
-    # ---- Input validation ----
-    if p_galetech_input <= 0 or p_galetech_input >= p_retail_input:
-        st.error(f"🛑 BOO PPA price must be between €0 and €{p_retail_input}/MWh.")
-        st.stop()
-    if min_bess > max_bess:
-        st.error("🛑 Min BESS cannot exceed max BESS.")
-        st.stop()
-    if min_turbines > int((site_area_acre / 5) * 2):
-        st.error("🛑 Minimum wind requirement exceeds available site area.")
-        st.stop()
-    if (min_turbines / 2.0) > (site_area_acre / 5.0):
-        st.error("🛑 Combined land constraint violated by minimum wind setting.")
-        st.stop()
+if run_btn or ('report_cache' in st.session_state):
+    if run_btn:
+        # ---- Input validation ----
+        if p_galetech_input <= 0 or p_galetech_input >= p_retail_input:
+            st.error(f"🛑 BOO PPA price must be between €0 and €{p_retail_input}/MWh.")
+            st.stop()
+        if min_bess > max_bess:
+            st.error("🛑 Min BESS cannot exceed max BESS.")
+            st.stop()
+        if min_turbines > int((site_area_acre / 5) * 2):
+            st.error("🛑 Minimum wind requirement exceeds available site area.")
+            st.stop()
+        if (min_turbines / 2.0) > (site_area_acre / 5.0):
+            st.error("🛑 Combined land constraint violated by minimum wind setting.")
+            st.stop()
 
-    # ---- Load data ----
-    rep_days          = load_custom_typical_days(df_customer, custom_weights)
-    # Max wind/solar are fully determined by site acreage.
-    effective_max_turbines = site_max_turbines
-    effective_max_solar    = site_max_solar
+        # ---- Load data ----
+        rep_days          = load_custom_typical_days(df_customer, custom_weights)
+        # Max wind/solar are fully determined by site acreage.
+        effective_max_turbines = site_max_turbines
+        effective_max_solar    = site_max_solar
 
-    # E-boiler capacity is optimized, not user-fixed.
-    # Use heat profile to set search bounds automatically.
-    max_gas_load_kw = max(float(np.max(day['gas_load'])) for day in rep_days) if rep_days else 0.0
-    if use_e_boiler and eboiler_eff_input > 0:
-        auto_max_eboiler_kw = int(np.ceil(max_gas_load_kw / eboiler_eff_input / 500.0) * 500)
-        auto_max_eboiler_kw = max(auto_max_eboiler_kw, 500)
-    else:
-        auto_max_eboiler_kw = 0
-    auto_min_eboiler_kw = 0
-
-    optimizer_params = {
-        'p_galetech':        p_galetech_input / 1000,   # €/kWh
-        'p_gas':             p_gas_input      / 1000,
-        'p_sell':            p_sell_input     / 1000,
-        'p_carbon':          p_carbon_input,
-        'carbon_credit_share': 0.5,
-        'grid_carbon_factor':  0.35,
-        'enable_e_boiler':   use_e_boiler,
-        'eboiler_eff':       eboiler_eff_input,
-        'eboiler_var_cost':  eboiler_var_cost_input / 1000,
-        'eboiler_max_kw':    auto_max_eboiler_kw,
-        'eboiler_capex_per_kw': c_eboiler_kw,
-        'eboiler_civil_cost':   c_eboiler_civil,
-        'eboiler_fixed_opex':   opex_eboiler_fixed,
-        'export_limit_kw':   export_limit_input,
-        'grid_buy_limit_kw': grid_buy_limit_input,
-        'cost_solar_mw':     c_solar_mw,
-        'cost_bess_mwh':     c_bess_mwh,
-        'solar_efficiency':  solar_efficiency,
-        'civil_solar':       cv_solar,
-        'civil_bess':        cv_bess,
-        'elec_per_source':   elec_conn,
-        'pm_rate':           pm_rate,
-        'insurance_rate':    ins_rate,
-        'maintenance_rate':  maint_rate,
-        'land_lease':        lease_cost,
-    }
-    optimizer = GaletechAssetOptimizer(optimizer_params)
-
-    turbine_choices = ["None", "EWT 500kW", "EWT 1MW", "E82 2.3MW",
-                       "V90 3MW", "E115 4.2MW", "E138 4.26MW"]
-
-    with st.spinner("Running two-stage optimisation (capacity sweep → fine dispatch)…"):
-        df_res, best = optimizer.two_stage_optimization(
-            rep_days, turbine_choices,
-            min_turbines, effective_max_turbines,
-            effective_max_solar, min_bess, max_bess,
-            site_area_acre,
-            optimization_metric=optimization_metric,
-            min_eboiler_kw=auto_min_eboiler_kw,
-            max_eboiler_kw=auto_max_eboiler_kw,
-        )
-
-    if df_res.empty or best is None:
-        st.error("No commercially viable configurations found. "
-                 "Try relaxing constraints or adjusting prices.")
-        st.stop()
-
-    # ---- Filter to viable payback range ----
-    df_viable = df_res[(df_res['Payback'] > 0) & (df_res['Payback'] < optimizer.project_life_years)].copy()
-    if optimization_metric == "IRR":
-        df_viable = df_viable.sort_values('IRR', ascending=False)
-    elif optimization_metric == "NPV":
-        df_viable = df_viable.sort_values('NPV10_M', ascending=False)
-    else:
-        df_viable = df_viable.sort_values('Payback', ascending=True)
-    df_viable.reset_index(drop=True, inplace=True)
-
-    if df_viable.empty:
-        st.warning(
-            "No configurations achieved positive payback within project life. "
-            "Showing the closest available configuration for diagnostics."
-        )
-        # Fall back to best available scenario by selected metric.
-        if optimization_metric == "IRR":
-            df_fallback = df_res.sort_values('IRR', ascending=False).reset_index(drop=True)
-        elif optimization_metric == "NPV":
-            df_fallback = df_res.sort_values('NPV10_M', ascending=False).reset_index(drop=True)
+        # E-boiler capacity is optimized, not user-fixed.
+        # Use heat profile to set search bounds automatically.
+        max_gas_load_kw = max(float(np.max(day['gas_load'])) for day in rep_days) if rep_days else 0.0
+        if use_e_boiler and eboiler_eff_input > 0:
+            auto_max_eboiler_kw = int(np.ceil(max_gas_load_kw / eboiler_eff_input / 500.0) * 500)
+            auto_max_eboiler_kw = max(auto_max_eboiler_kw, 500)
         else:
-            df_fallback = df_res.sort_values('Payback', ascending=True).reset_index(drop=True)
-        best = df_fallback.iloc[0].copy()
-        has_viable_payback = False
-        st.info(
-            f"Best available now: Payback={best['Payback']:.1f} yrs, "
-            f"IRR={best['IRR']:.1f}%, NPV={best['NPV10_M']:.2f} M€. "
-            "You can improve viability by increasing electricity price, reducing CAPEX assumptions, "
-            "or relaxing site/BESS constraints."
+            auto_max_eboiler_kw = 0
+        auto_min_eboiler_kw = 0
+
+        optimizer_params = {
+            'p_galetech':        p_galetech_input / 1000,   # €/kWh
+            'p_gas':             p_gas_input      / 1000,
+            'p_sell':            p_sell_input     / 1000,
+            'p_carbon':          p_carbon_input,
+            'carbon_credit_share': 0.5,
+            'grid_carbon_factor':  0.35,
+            'enable_e_boiler':   use_e_boiler,
+            'eboiler_eff':       eboiler_eff_input,
+            'eboiler_var_cost':  eboiler_var_cost_input / 1000,
+            'eboiler_max_kw':    auto_max_eboiler_kw,
+            'eboiler_capex_per_kw': c_eboiler_kw,
+            'eboiler_civil_cost':   c_eboiler_civil,
+            'eboiler_fixed_opex':   opex_eboiler_fixed,
+            'export_limit_kw':   export_limit_input,
+            'grid_buy_limit_kw': grid_buy_limit_input,
+            'cost_solar_mw':     c_solar_mw,
+            'cost_bess_mwh':     c_bess_mwh,
+            'solar_efficiency':  solar_efficiency,
+            'civil_solar':       cv_solar,
+            'civil_bess':        cv_bess,
+            'elec_per_source':   elec_conn,
+            'pm_rate':           pm_rate,
+            'insurance_rate':    ins_rate,
+            'maintenance_rate':  maint_rate,
+            'land_lease':        lease_cost,
+        }
+        optimizer = GaletechAssetOptimizer(optimizer_params)
+
+        turbine_choices = ["None", "EWT 500kW", "EWT 1MW", "E82 2.3MW",
+                           "V90 3MW", "E115 4.2MW", "E138 4.26MW"]
+
+        with st.spinner("Running two-stage optimisation (capacity sweep → fine dispatch)…"):
+            df_res, best = optimizer.two_stage_optimization(
+                rep_days, turbine_choices,
+                min_turbines, effective_max_turbines,
+                effective_max_solar, min_bess, max_bess,
+                site_area_acre,
+                optimization_metric=optimization_metric,
+                min_eboiler_kw=auto_min_eboiler_kw,
+                max_eboiler_kw=auto_max_eboiler_kw,
+            )
+
+        if df_res.empty or best is None:
+            st.error("No commercially viable configurations found. "
+                     "Try relaxing constraints or adjusting prices.")
+            st.stop()
+
+        # ---- Filter to viable payback range ----
+        df_viable = df_res[(df_res['Payback'] > 0) & (df_res['Payback'] < optimizer.project_life_years)].copy()
+        if optimization_metric == "IRR":
+            df_viable = df_viable.sort_values('IRR', ascending=False)
+        elif optimization_metric == "NPV":
+            df_viable = df_viable.sort_values('NPV10_M', ascending=False)
+        else:
+            df_viable = df_viable.sort_values('Payback', ascending=True)
+        df_viable.reset_index(drop=True, inplace=True)
+
+        if df_viable.empty:
+            st.warning(
+                "No configurations achieved positive payback within project life. "
+                "Showing the closest available configuration for diagnostics."
+            )
+            # Fall back to best available scenario by selected metric.
+            if optimization_metric == "IRR":
+                df_fallback = df_res.sort_values('IRR', ascending=False).reset_index(drop=True)
+            elif optimization_metric == "NPV":
+                df_fallback = df_res.sort_values('NPV10_M', ascending=False).reset_index(drop=True)
+            else:
+                df_fallback = df_res.sort_values('Payback', ascending=True).reset_index(drop=True)
+            best = df_fallback.iloc[0].copy()
+            has_viable_payback = False
+            st.info(
+                f"Best available now: Payback={best['Payback']:.1f} yrs, "
+                f"IRR={best['IRR']:.1f}%, NPV={best['NPV10_M']:.2f} M€. "
+                "You can improve viability by increasing electricity price, reducing CAPEX assumptions, "
+                "or relaxing site/BESS constraints."
+            )
+        else:
+            best = df_viable.iloc[0].copy()
+            has_viable_payback = True
+
+        # ---- Compute minimum PPA for target IRR ----
+        capex, _, _, _, _ = optimizer.get_capex(best['t_model_raw'], best['t_count_raw'],
+                                                 best['Solar_MW'], best['BESS_MWh'],
+                                                 eboiler_kw=best.get('EBoiler_kW', 0))
+        annual_opex, _, _, _ = optimizer.get_opex(capex)
+        revenue   = best['Profit_k'] * 1000 + annual_opex
+        btm_e     = best['Elec_Offset_MWh'] * 1000   # kWh/year
+        target_irr = target_irr_input / 100
+        pv_factor  = (1 - (1 + target_irr) ** -optimizer.project_life_years) / target_irr
+        req_profit = capex / pv_factor if pv_factor > 0 else 0
+        req_revenue = req_profit + annual_opex
+        rev_non_elec = revenue - (btm_e * (p_galetech_input / 1000)) if btm_e > 0 else 0
+        min_ppa_elec = (req_revenue - rev_non_elec) / btm_e * 1000 if btm_e > 0 else 0
+        best['Min_Elec_PPA'] = min_ppa_elec
+
+        # ---- Annual cash-flow table ----
+        best_capex     = best['CAPEX_M'] * 1e6
+        best_opex      = best['OPEX_k']  * 1e3
+        best_netprofit = best['Profit_k'] * 1e3
+        best_revenue_  = best_netprofit + best_opex
+        cashflow_rows  = [{'Year': 0, 'CAPEX': -best_capex, 'Revenue': 0.0,
+                           'OPEX': 0.0, 'NetProfit': -best_capex, 'CashFlow': -best_capex}]
+        for y in range(1, optimizer.project_life_years + 1):
+            cashflow_rows.append({'Year': y, 'CAPEX': 0.0, 'Revenue': best_revenue_,
+                                  'OPEX': best_opex, 'NetProfit': best_netprofit,
+                                  'CashFlow': best_netprofit})
+        df_cashflow = pd.DataFrame(cashflow_rows)
+        # Cumulative profit by year (running total of annual net profit).
+        df_cashflow['CumulativeProfit'] = df_cashflow['NetProfit'].cumsum()
+
+        # ---- Dispatch traces for best config ----
+        df_traces = optimizer.evaluate_combination(
+            best['t_model_raw'], best['t_count_raw'],
+            best['Solar_MW'], best['BESS_MWh'],
+            rep_days, return_traces=True,
+            eboiler_kw=best.get('EBoiler_kW', 0),
         )
+        csv_buffer = io.StringIO()
+        df_traces.to_csv(csv_buffer, index=False)
+        csv_data = csv_buffer.getvalue().encode('utf-8')
+
+        st.session_state['report_cache'] = {
+            'df_res': df_res,
+            'df_viable': df_viable,
+            'best': best,
+            'has_viable_payback': has_viable_payback,
+            'df_cashflow': df_cashflow,
+            'df_traces': df_traces,
+            'csv_data': csv_data,
+            'rep_days': rep_days,
+            'optimizer_params': optimizer_params,
+            'optimization_metric': optimization_metric,
+            'target_irr_input': target_irr_input,
+        }
     else:
-        best = df_viable.iloc[0].copy()
-        has_viable_payback = True
+        cache = st.session_state['report_cache']
+        df_res = cache['df_res']
+        df_viable = cache['df_viable']
+        best = cache['best']
+        has_viable_payback = cache['has_viable_payback']
+        df_cashflow = cache['df_cashflow']
+        df_traces = cache['df_traces']
+        csv_data = cache['csv_data']
+        rep_days = cache['rep_days']
+        optimizer_params = cache['optimizer_params']
+        optimization_metric = cache['optimization_metric']
+        target_irr_input = cache['target_irr_input']
+        optimizer = GaletechAssetOptimizer(optimizer_params)
 
-    # ---- Compute minimum PPA for target IRR ----
-    capex, _, _, _, _ = optimizer.get_capex(best['t_model_raw'], best['t_count_raw'],
-                                             best['Solar_MW'], best['BESS_MWh'],
-                                             eboiler_kw=best.get('EBoiler_kW', 0))
-    annual_opex, _, _, _ = optimizer.get_opex(capex)
-    revenue   = best['Profit_k'] * 1000 + annual_opex
-    btm_e     = best['Elec_Offset_MWh'] * 1000   # kWh/year
-    target_irr = target_irr_input / 100
-    pv_factor  = (1 - (1 + target_irr) ** -optimizer.project_life_years) / target_irr
-    req_profit = capex / pv_factor if pv_factor > 0 else 0
-    req_revenue = req_profit + annual_opex
-    rev_non_elec = revenue - (btm_e * (p_galetech_input / 1000)) if btm_e > 0 else 0
-    min_ppa_elec = (req_revenue - rev_non_elec) / btm_e * 1000 if btm_e > 0 else 0
-    best['Min_Elec_PPA'] = min_ppa_elec
-
-    # ---- Annual cash-flow table ----
-    best_capex     = best['CAPEX_M'] * 1e6
-    best_opex      = best['OPEX_k']  * 1e3
-    best_netprofit = best['Profit_k'] * 1e3
-    best_revenue_  = best_netprofit + best_opex
-    cashflow_rows  = [{'Year': 0, 'CAPEX': -best_capex, 'Revenue': 0.0,
-                       'OPEX': 0.0, 'NetProfit': -best_capex, 'CashFlow': -best_capex}]
-    for y in range(1, optimizer.project_life_years + 1):
-        cashflow_rows.append({'Year': y, 'CAPEX': 0.0, 'Revenue': best_revenue_,
-                              'OPEX': best_opex, 'NetProfit': best_netprofit,
-                              'CashFlow': best_netprofit})
-    df_cashflow = pd.DataFrame(cashflow_rows)
-
-    # ---- Dispatch traces for best config ----
     st.session_state['best_config'] = best
-    st.session_state['rep_days']    = rep_days
-
-    df_traces = optimizer.evaluate_combination(
-        best['t_model_raw'], best['t_count_raw'],
-        best['Solar_MW'], best['BESS_MWh'],
-        rep_days, return_traces=True,
-        eboiler_kw=best.get('EBoiler_kW', 0),
-    )
-    csv_buffer = io.StringIO()
-    df_traces.to_csv(csv_buffer, index=False)
-    csv_data = csv_buffer.getvalue().encode('utf-8')
+    st.session_state['rep_days'] = rep_days
 
     if has_viable_payback:
         st.success("✅ Optimisation complete. Bankable report generated.")
@@ -1087,6 +1118,7 @@ if run_btn:
                 'OPEX':      '€{:,.0f}',
                 'NetProfit': '€{:,.0f}',
                 'CashFlow':  '€{:,.0f}',
+                'CumulativeProfit': '€{:,.0f}',
             })
         )
 
