@@ -187,12 +187,12 @@ class GaletechAssetOptimizer:
             return pd.DataFrame(all_traces)
         return annual_revenue, annual_co2_saved, annual_btm_supply_kwh, annual_btm_gas_kwh, annual_curtailed_kwh, annual_curtail_cost
 
-    def two_stage_optimization(self, rep_days, turbine_choices, min_turbines, max_turbines, min_solar, max_solar, min_bess, max_bess, export_limit_kw, optimization_metric='Payback'):
+    def two_stage_optimization(self, rep_days, turbine_choices, min_turbines, max_turbines, max_solar, min_bess, max_bess, site_area_acre, optimization_metric='Payback'):
         # Stage 1: coarse capacity sweep
         stage1_results = []
         t_start = max(min_turbines, 0)
-        s_start = max(min_solar, 0)
         b_start = max(min_bess, 0)
+        s_start = 0
         t_count_steps = range(t_start, max_turbines + 1, max(1, max(1, max_turbines - t_start) // 3)) if max_turbines >= t_start else [t_start]
         s_steps = range(s_start, max_solar + 1, max(1, max(1, max_solar - s_start) // 3)) if max_solar >= s_start else [s_start]
         b_steps = range(b_start, max_bess + 1, max(1, max(1, max_bess - b_start) // 3)) if max_bess >= b_start else [b_start]
@@ -204,10 +204,10 @@ class GaletechAssetOptimizer:
                 if t_model != 'None' and t_count == 0 and min_turbines > 0:
                     continue
                 for s in s_steps:
-                    if s < min_solar: continue
                     for b in b_steps:
                         if b < min_bess: continue
                         if t_count == 0 and s == 0 and b == 0: continue
+                        if 10 * t_count + 5 * s > site_area_acre: continue
                         capex, _, _, _, _ = self.get_capex(t_model, t_count, s, b)
                         annual_opex, _, _, _ = self.get_opex(capex)
                         out = self.evaluate_combination(t_model, t_count, s, b, rep_days)
@@ -247,11 +247,11 @@ class GaletechAssetOptimizer:
             counts = [0] if t_model == 'None' else list({max(min_turbines, best_t - 1), best_t, min(max_turbines, best_t + 1)})
             for t_count in counts:
                 if t_count < min_turbines: continue
-                for s in [max(min_solar, best_s - 1), best_s, min(max_solar, best_s + 1)]:
-                    if s < min_solar: continue
+                for s in [max(0, best_s - 1), best_s, min(max_solar, best_s + 1)]:
                     for b in [max(min_bess, best_b - 1), best_b, min(max_bess, best_b + 1)]:
                         if b < min_bess: continue
                         if t_count == 0 and s == 0 and b == 0: continue
+                        if 10 * t_count + 5 * s > site_area_acre: continue
                         candidates.append((t_model, t_count, s, b))
 
         final_results = []
@@ -646,8 +646,6 @@ with st.sidebar:
     target_irr_input = st.number_input("Target IRR for Minimum PPA (%)", value=10.0)
 
     st.header("📌 Strategy Filters")
-    require_wind = st.checkbox("Require at least one wind turbine", value=False)
-    require_bess = st.checkbox("Require at least one battery storage", value=False)
     optimization_metric = st.selectbox("Select optimization metric", ["Payback","IRR","NPV"], index=0)
 
     with st.expander("🛠️ Advanced CAPEX Assumptions", expanded=False):
@@ -663,20 +661,36 @@ with st.sidebar:
         lease_cost = st.number_input("Land Lease (€/Year)", value=100000)
 
     st.divider()
-    st.header("📐 Physical Search Limits")
-    min_turbines = st.number_input("Min Turbines", 0, 40, 0)
-    min_solar = st.number_input("Min Solar (MW)", 0, 40, 0)
-    min_bess = st.number_input("Min BESS (MWh)", 0, 40, 0)
-    max_turbines = st.slider("Max Turbines", 0, 40, 10)
-    max_solar = st.slider("Max Solar PV (MW)", 0, 40, 10, step=2)
-    max_bess = st.slider("Max BESS (MWh)", 0, 40, 10, step=1)
-    export_limit_input = st.number_input("Grid Export Limit (kW)", value=5000, min_value=0, max_value=20000)
+    st.header("📐 Physical & Site Constraints")
+    site_area_acre = st.number_input("Site Area (acre)", min_value=0.0, max_value=5000.0, value=100.0, step=5.0)
+    col1, col2 = st.columns(2)
+    with col1:
+        min_turbines = st.number_input("Min Turbines", 0, 40, 0)
+        max_turbines = st.slider("Max Turbines", 0, 40, 10)
+        min_bess = st.number_input("Min BESS (MWh)", 0, 40, 0)
+        max_bess = st.slider("Max BESS (MWh)", 0, 40, 10, step=1)
+    with col2:
+        max_solar = st.slider("Max Solar PV (MW)", 0, 40, 10, step=2)
+        export_limit_input = st.number_input("Grid Export Limit (kW)", value=5000, min_value=0, max_value=20000)
+        st.caption("Site rule: 5 acre per 1 MW solar, 10 acre per 1 wind turbine")
+    st.caption(f"Standalone site maxima: Solar <= {int(site_area_acre // 5)} MW, Wind <= {int(site_area_acre // 10)} turbines; combined constraint: 5 x Solar_MW + 10 x Turbines <= Site Area")
     run_btn = st.button("🚀 Generate Bankable Report", type="primary", use_container_width=True)
 
 if run_btn:
     if p_galetech_input <= 0 or p_galetech_input >= p_retail_input:
         st.error(f"🛑 Commercial Error: The BOO PPA Price must be between €0 and €{p_retail_input}.")
         st.stop()
+    if min_turbines > max_turbines:
+        st.error("🛑 Physical Constraint Error: Min Turbines cannot exceed Max Turbines.")
+        st.stop()
+    if min_bess > max_bess:
+        st.error("🛑 Physical Constraint Error: Min BESS cannot exceed Max BESS.")
+        st.stop()
+    if min_turbines * 10 > site_area_acre:
+        st.error("🛑 Site Constraint Error: Minimum wind requirement exceeds available site area.")
+        st.stop()
+    if max_solar > site_area_acre / 5 and min_turbines == 0:
+        st.warning("Configured Max Solar exceeds standalone site-based solar limit. Combined site constraint will cap feasible solutions automatically.")
         
     rep_days = load_custom_typical_days(df_customer, custom_weights)
     
@@ -699,9 +713,9 @@ if run_btn:
         df_res, best = optimizer.two_stage_optimization(
             rep_days, turbine_choices,
             min_turbines, max_turbines,
-            min_solar, max_solar,
+            max_solar,
             min_bess, max_bess,
-            export_limit_input,
+            site_area_acre,
             optimization_metric=optimization_metric
         )
 
