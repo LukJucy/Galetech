@@ -47,14 +47,19 @@ class GaletechAssetOptimizer:
         equip_wind = self.turbine_models[t_model]["equip_cost"] * t_count
         equip_solar = s_mw * self.params['cost_solar_mw']
         equip_bess = b_mwh * self.params['cost_bess_mwh']
-        equip_total = equip_wind + equip_solar + equip_bess
+        eboiler_capex = 0
+        if self.params.get('enable_e_boiler', True):
+            eboiler_capex = self.params.get('eboiler_capex_per_kw', 120) * self.params.get('eboiler_max_kw', 0)
+        equip_total = equip_wind + equip_solar + equip_bess + eboiler_capex
         
         civils = 0
         if t_count > 0: civils += self.turbine_models[t_model]["civil_cost"] * t_count
         if s_mw > 0: civils += self.params['civil_solar']
         if b_mwh > 0: civils += self.params['civil_bess']
+        if self.params.get('enable_e_boiler', True) and self.params.get('eboiler_max_kw', 0) > 0:
+            civils += self.params.get('eboiler_civil_cost', 80000)
         
-        sources_count = sum([w_mw > 0, s_mw > 0, b_mwh > 0])
+        sources_count = sum([w_mw > 0, s_mw > 0, b_mwh > 0, self.params.get('enable_e_boiler', True) and self.params.get('eboiler_max_kw', 0) > 0])
         elec = sources_count * self.params['elec_per_source']
         
         subtotal = equip_total + civils + elec
@@ -66,7 +71,8 @@ class GaletechAssetOptimizer:
         insurance = total_capex * self.params['insurance_rate']
         maintenance = total_capex * self.params['maintenance_rate']
         lease = self.params['land_lease']
-        return insurance + maintenance + lease, insurance, maintenance, lease
+        eboiler_fixed_opex = self.params.get('eboiler_fixed_opex', 15000) if self.params.get('enable_e_boiler', True) else 0
+        return insurance + maintenance + lease + eboiler_fixed_opex, insurance, maintenance, lease + eboiler_fixed_opex
 
     def evaluate_combination(self, t_model, t_count, s_mw, b_mwh, rep_days, return_traces=False, wind_shock=1.0, ppa_shock=1.0):
         # t_model: wind turbine type key
@@ -81,12 +87,17 @@ class GaletechAssetOptimizer:
         annual_revenue = 0  # accumulated scenario-weighted revenue
         annual_co2_saved = 0  # total CO2 tonnes avoided
         annual_btm_supply_kwh = 0  # behind-the-meter electricity supplied in kWh
-        annual_btm_gas_kwh = 0  # gas avoided/supplied equivalence
+        annual_heat_from_elec_kwh = 0  # heat served by electric boiler (kWh_th)
+        annual_gas_used_kwh = 0  # heat served by natural gas (kWh_th)
         annual_curtailed_kwh = 0  # curtailed energy in kWh
         annual_curtail_cost = 0  # cost of curtailed energy in Euros
 
         bess_wear_cost = (b_mwh * self.params['cost_bess_mwh']) / (self.bess_cycles * b_mwh * 1000) if b_mwh > 0 else 0
         carbon_premium = self.gas_carbon_factor * self.params['p_carbon'] / 1000
+        eboiler_enabled = self.params.get('enable_e_boiler', True)
+        eboiler_eff = self.params.get('eboiler_eff', 0.95)
+        eboiler_var_cost = self.params.get('eboiler_var_cost', 0.008)  # EUR/kWh_th
+        eboiler_max_kw = self.params.get('eboiler_max_kw', 1e6)
 
         export_limit_kw = self.params.get('export_limit_kw', 5000)
         bess_max_power_kw = (b_mwh * 1000) * 0.5 if b_mwh > 0 else 0
@@ -99,7 +110,8 @@ class GaletechAssetOptimizer:
             p_dis = cp.Variable(T, nonneg=True)
             soc = cp.Variable(T, nonneg=True)
             p_btm_supply = cp.Variable(T, nonneg=True)
-            p_gas_replaced = cp.Variable(T, nonneg=True)
+            p_eboiler_elec = cp.Variable(T, nonneg=True)
+            p_gas_used = cp.Variable(T, nonneg=True)
             p_grid_sell = cp.Variable(T, nonneg=True)
             p_grid_buy = cp.Variable(T, nonneg=True)
             p_curtail = cp.Variable(T, nonneg=True)
@@ -118,9 +130,8 @@ class GaletechAssetOptimizer:
 
             constraints = [
                 p_wind + p_solar + p_dis + p_grid_buy == p_btm_supply + p_grid_sell + p_ch + p_curtail,
-                p_btm_supply >= day['elec_load'] + p_gas_replaced,
-                p_gas_replaced >= day['gas_load'],
-                p_gas_replaced <= day['gas_load'],
+                p_btm_supply == day['elec_load'] + p_eboiler_elec,
+                eboiler_eff * p_eboiler_elec + p_gas_used == day['gas_load'],
                 p_grid_sell <= export_limit_kw,
                 p_grid_buy <= grid_buy_limit_kw,
                 p_grid_sell <= export_limit_kw * z_grid,
@@ -129,6 +140,11 @@ class GaletechAssetOptimizer:
                 z_grid <= 1,
                 p_curtail <= p_wind + p_solar
             ]
+
+            if eboiler_enabled:
+                constraints += [p_eboiler_elec <= eboiler_max_kw]
+            else:
+                constraints += [p_eboiler_elec == 0]
 
             if b_mwh > 0:
                 cap_kwh = b_mwh * 1000
@@ -149,12 +165,14 @@ class GaletechAssetOptimizer:
             else:
                 constraints += [p_ch == 0, p_dis == 0, soc == 0]
 
-            rev_customer = cp.sum(p_btm_supply * (self.params['p_galetech'] * ppa_shock))
+            rev_customer = cp.sum(day['elec_load'] * (self.params['p_galetech'] * ppa_shock))
             rev_grid = cp.sum(p_grid_sell * self.params['p_sell'])
-            val_carbon = cp.sum(p_gas_replaced * carbon_premium)
             grid_purchase_cost = cp.sum(p_grid_buy * (self.params['p_sell'] * 0.8))
+            gas_cost = cp.sum(p_gas_used * self.params['p_gas'])
+            carbon_cost = cp.sum(p_gas_used * carbon_premium)
+            eboiler_cost = cp.sum((eboiler_eff * p_eboiler_elec) * eboiler_var_cost)
 
-            obj = cp.Maximize(rev_customer + rev_grid + val_carbon - grid_purchase_cost - cp.sum(p_dis * bess_wear_cost))
+            obj = cp.Maximize(rev_customer + rev_grid - grid_purchase_cost - gas_cost - carbon_cost - eboiler_cost - cp.sum(p_dis * bess_wear_cost))
             prob = cp.Problem(obj, constraints)
 
             try:
@@ -164,9 +182,10 @@ class GaletechAssetOptimizer:
                     prob.solve(solver=cp.ECOS)
                 if prob.status not in ["infeasible", "unbounded"] and prob.value is not None:
                     annual_revenue += prob.value * day['weight']
-                    annual_co2_saved += np.sum(p_gas_replaced.value) * self.gas_carbon_factor / 1000 * day['weight']
+                    annual_co2_saved += (np.sum(day['gas_load']) - np.sum(p_gas_used.value)) * self.gas_carbon_factor / 1000 * day['weight']
                     annual_btm_supply_kwh += np.sum(p_btm_supply.value) * day['weight']
-                    annual_btm_gas_kwh += np.sum(p_gas_replaced.value) * day['weight']
+                    annual_heat_from_elec_kwh += np.sum(eboiler_eff * p_eboiler_elec.value) * day['weight']
+                    annual_gas_used_kwh += np.sum(p_gas_used.value) * day['weight']
                     annual_curtailed_kwh += np.sum(p_curtail.value) * day['weight']
                     annual_curtail_cost += np.sum(p_curtail.value) * self.params['p_sell'] * day['weight']
 
@@ -177,6 +196,7 @@ class GaletechAssetOptimizer:
                                 "Elec_Demand_kW": day['elec_load'][t], "Gas_Demand_kW": day['gas_load'][t],
                                 "Wind_Gen_kW": p_wind[t], "Solar_Gen_kW": p_solar[t],
                                 "BESS_SoC_kWh": soc.value[t] if b_mwh > 0 else 0,
+                                "EBoiler_Elec_kW": p_eboiler_elec.value[t], "Gas_Used_kWth": p_gas_used.value[t],
                                 "BTM_Supply_kW": p_btm_supply.value[t], "Grid_Export_kW": p_grid_sell.value[t],
                                 "Curtailed_kW": p_curtail.value[t]
                             })
@@ -185,7 +205,7 @@ class GaletechAssetOptimizer:
 
         if return_traces:
             return pd.DataFrame(all_traces)
-        return annual_revenue, annual_co2_saved, annual_btm_supply_kwh, annual_btm_gas_kwh, annual_curtailed_kwh, annual_curtail_cost
+        return annual_revenue, annual_co2_saved, annual_btm_supply_kwh, annual_heat_from_elec_kwh, annual_gas_used_kwh, annual_curtailed_kwh, annual_curtail_cost
 
     def two_stage_optimization(self, rep_days, turbine_choices, min_turbines, max_turbines, max_solar, min_bess, max_bess, site_area_acre, optimization_metric='Payback'):
         # Stage 1: coarse capacity sweep
@@ -212,7 +232,7 @@ class GaletechAssetOptimizer:
                         annual_opex, _, _, _ = self.get_opex(capex)
                         out = self.evaluate_combination(t_model, t_count, s, b, rep_days)
                         if out is None: continue
-                        revenue, co2, btm_e, btm_g, curt, curt_cost = out
+                        revenue, co2, btm_e, heat_elec, gas_used, curt, curt_cost = out
                         net_profit = revenue - annual_opex
                         irr = npf.irr([-capex] + [net_profit] * self.project_life_years) if net_profit > 0 else 0
                         npv = npf.npv(self.discount_rate, [-capex] + [net_profit] * self.project_life_years)
@@ -222,7 +242,7 @@ class GaletechAssetOptimizer:
                                                'Solar_MW': s, 'BESS_MWh': b,
                                                'CAPEX_M': capex/1e6, 'OPEX_k': annual_opex/1e3, 'Profit_k': net_profit/1e3,
                                                'Payback': payback, 'IRR': irr*100, 'NPV10_M': npv/1e6,
-                                               'CO2_T': co2, 'Elec_Offset_MWh': btm_e/1000, 'Gas_Offset_MWh': btm_g/1000,
+                                               'CO2_T': co2, 'Elec_Offset_MWh': btm_e/1000, 'Heat_By_EBoiler_MWh': heat_elec/1000, 'Gas_Used_MWh': gas_used/1000,
                                                'Curtailed_MWh': curt/1000, 'Min_Elec_PPA': 0}
                                               )
 
@@ -260,7 +280,7 @@ class GaletechAssetOptimizer:
             annual_opex, _, _, _ = self.get_opex(capex)
             out = self.evaluate_combination(t_model, t_count, s, b, rep_days)
             if out is None: continue
-            revenue, co2, btm_e, btm_g, curt, curt_cost = out
+            revenue, co2, btm_e, heat_elec, gas_used, curt, curt_cost = out
             net_profit = revenue - annual_opex
             irr = npf.irr([-capex] + [net_profit] * self.project_life_years) if net_profit > 0 else 0
             npv = npf.npv(self.discount_rate, [-capex] + [net_profit] * self.project_life_years)
@@ -270,7 +290,7 @@ class GaletechAssetOptimizer:
                                   'Solar_MW': s, 'BESS_MWh': b,
                                   'CAPEX_M': capex/1e6, 'OPEX_k': annual_opex/1e3, 'Profit_k': net_profit/1e3,
                                   'Payback': payback, 'IRR': irr*100, 'NPV10_M': npv/1e6,
-                                  'CO2_T': co2, 'Elec_Offset_MWh': btm_e/1000, 'Gas_Offset_MWh': btm_g/1000,
+                                  'CO2_T': co2, 'Elec_Offset_MWh': btm_e/1000, 'Heat_By_EBoiler_MWh': heat_elec/1000, 'Gas_Used_MWh': gas_used/1000,
                                   'Curtailed_MWh': curt/1000, 'Min_Elec_PPA': 0}
                                  )
 
@@ -644,6 +664,10 @@ with st.sidebar:
     p_sell_input = st.number_input("Grid Export Price (€/MWh)", value=50.0)
     p_carbon_input = st.number_input("Carbon Value (€/Tonne)", value=65.0)
     target_irr_input = st.number_input("Target IRR for Minimum PPA (%)", value=10.0)
+    use_e_boiler = st.checkbox("Enable Electric Boiler Option", value=True)
+    eboiler_eff_input = st.number_input("Electric Boiler Efficiency (%)", min_value=70.0, max_value=100.0, value=95.0) / 100
+    eboiler_var_cost_input = st.number_input("Electric Boiler Variable Cost (€/MWh_th)", min_value=0.0, max_value=200.0, value=8.0)
+    eboiler_max_kw_input = st.number_input("Electric Boiler Max Power (kW)", min_value=0, max_value=100000, value=15000)
 
     st.header("📌 Strategy Filters")
     optimization_metric = st.selectbox("Select optimization metric", ["Payback","IRR","NPV"], index=0)
@@ -651,6 +675,9 @@ with st.sidebar:
     with st.expander("🛠️ Advanced CAPEX Assumptions", expanded=False):
         c_solar_mw = st.number_input("Solar Equip Cost (€/MW)", value=1000000)
         c_bess_mwh = st.number_input("BESS Equip Cost (€/MWh)", value=300000)
+        c_eboiler_kw = st.number_input("E-Boiler Equip Cost (€/kW_th)", value=120)
+        c_eboiler_civil = st.number_input("Civils - E-Boiler (€/Site)", value=80000)
+        opex_eboiler_fixed = st.number_input("E-Boiler Fixed OPEX (€/Year)", value=15000)
         solar_efficiency = st.number_input("Solar Efficiency (%)", value=20.0) / 100  # Convert to decimal
         cv_solar = st.number_input("Civils - Solar (€/Site)", value=300000)
         cv_bess = st.number_input("Civils - BESS (€/Site)", value=300000)
@@ -700,6 +727,9 @@ if run_btn:
     optimizer_params = {
         'p_galetech': p_galetech_input / 1000, 'p_gas': p_gas_input / 1000, 
         'p_sell': p_sell_input / 1000, 'p_carbon': p_carbon_input,
+        'enable_e_boiler': use_e_boiler, 'eboiler_eff': eboiler_eff_input,
+        'eboiler_var_cost': eboiler_var_cost_input / 1000, 'eboiler_max_kw': eboiler_max_kw_input,
+        'eboiler_capex_per_kw': c_eboiler_kw, 'eboiler_civil_cost': c_eboiler_civil, 'eboiler_fixed_opex': opex_eboiler_fixed,
         'export_limit_kw': export_limit_input,
         'cost_solar_mw': c_solar_mw, 'cost_bess_mwh': c_bess_mwh, 'solar_efficiency': solar_efficiency,
         'civil_solar': cv_solar, 'civil_bess': cv_bess,
@@ -799,16 +829,19 @@ if run_btn:
         col1.metric("Payback Period", f"{best['Payback']:.1f} Years")
         col2.metric("Project IRR", f"{best['IRR']:.1f} %")
         col3.metric("NPV @ 10%", f"€ {best['NPV10_M']:.2f} M")
-        col4.metric("Gas Offset", f"{int(best['Gas_Offset_MWh'])} MWh")
+        col4.metric("E-Boiler Heat", f"{int(best['Heat_By_EBoiler_MWh'])} MWh")
+        st.caption(f"Gas used for heat in optimum: {best['Gas_Used_MWh']:.0f} MWh")
+        heat_mode = "Electric Boiler Preferred" if best['Heat_By_EBoiler_MWh'] > best['Gas_Used_MWh'] else "Gas Boiler Preferred"
+        st.info(f"Optimal heating dispatch choice: {heat_mode}")
 
         st.info(f"**Suggested Minimum Elec PPA Price to achieve {target_irr_input}% IRR:** € {best['Min_Elec_PPA']:.2f} / MWh")
         
     with tab2:
         st.header("Financial Performance & Breakdown")
-        show_cols = ['Turbine', 'Solar_MW', 'BESS_MWh', 'Payback', 'IRR', 'NPV10_M', 'CAPEX_M', 'Elec_Offset_MWh', 'Gas_Offset_MWh', 'Curtailed_MWh']
+        show_cols = ['Turbine', 'Solar_MW', 'BESS_MWh', 'Payback', 'IRR', 'NPV10_M', 'CAPEX_M', 'Elec_Offset_MWh', 'Heat_By_EBoiler_MWh', 'Gas_Used_MWh', 'Curtailed_MWh']
         st.dataframe(df_viable[show_cols].head(10).style.format({
             'CAPEX_M': '{:.2f}', 'NPV10_M': '{:.2f}', 'IRR': '{:.1f}%', 'Payback': '{:.1f} Yrs',
-            'Elec_Offset_MWh': '{:.0f}', 'Gas_Offset_MWh': '{:.0f}', 
+            'Elec_Offset_MWh': '{:.0f}', 'Heat_By_EBoiler_MWh': '{:.0f}', 'Gas_Used_MWh': '{:.0f}',
             'Curtailed_MWh': '{:.0f}'
         }))
 
@@ -873,7 +906,7 @@ if run_btn:
                 capex, _, _, _, _ = optimizer.get_capex(best_conf['t_model_raw'], best_conf['t_count_raw'], best_conf['Solar_MW'], best_conf['BESS_MWh'], capex_shock)
                 annual_opex, _, _, _ = optimizer.get_opex(capex)
                 
-                rev, co2, btm_e, btm_g, curt, curt_cost = optimizer.evaluate_combination(
+                rev, co2, btm_e, heat_elec, gas_used, curt, curt_cost = optimizer.evaluate_combination(
                     best_conf['t_model_raw'], best_conf['t_count_raw'], best_conf['Solar_MW'], best_conf['BESS_MWh'], 
                     st.session_state['rep_days'], wind_shock=wind_shock, ppa_shock=ppa_shock
                 )
