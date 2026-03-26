@@ -5,6 +5,10 @@ import cvxpy as cp
 import matplotlib.pyplot as plt
 import numpy_financial as npf
 import io
+import json
+from datetime import date
+from urllib.parse import urlencode
+from urllib.request import urlopen
 
 # ==========================================
 # 1. Core optimization engine
@@ -553,18 +557,159 @@ class GaletechAssetOptimizer:
 # ==========================================
 # 2. Data preparation helpers
 # ==========================================
-def load_custom_typical_days(df=None, custom_weights=None, show_warnings=True):
+def get_synthetic_weather_profiles():
+    return [
+        {
+            'label': 'Summer',
+            'wind_speed': 7 + 2.5 * np.sin((np.arange(24) - 3) * np.pi / 12),
+            'irradiance': np.array([
+                0, 0, 0, 0, 20, 100, 250, 450, 700, 900, 1000, 1050,
+                1050, 980, 850, 650, 400, 180, 60, 10, 0, 0, 0, 0,
+            ], dtype=float),
+        },
+        {
+            'label': 'Winter',
+            'wind_speed': 9 + 3.0 * np.sin((np.arange(24) + 1) * np.pi / 12),
+            'irradiance': np.array([
+                0, 0, 0, 0, 15, 80, 200, 380, 620, 820, 900, 950,
+                950, 900, 760, 560, 320, 130, 40, 5, 0, 0, 0, 0,
+            ], dtype=float),
+        },
+        {
+            'label': 'Spring/Autumn',
+            'wind_speed': 8 + 2.0 * np.cos((np.arange(24) - 2) * np.pi / 12),
+            'irradiance': np.array([
+                0, 0, 0, 0, 18, 90, 220, 410, 660, 860, 960, 1010,
+                1010, 940, 800, 600, 350, 150, 50, 8, 0, 0, 0, 0,
+            ], dtype=float),
+        },
+    ]
+
+
+def get_weather_profile_by_index(weather_profiles, index):
+    profiles = weather_profiles if weather_profiles else get_synthetic_weather_profiles()
+    return profiles[index % len(profiles)]
+
+
+def get_average_weather_profile(weather_profiles=None):
+    profiles = weather_profiles if weather_profiles else get_synthetic_weather_profiles()
+    return {
+        'label': 'Average of Seasonal Profiles',
+        'wind_speed': np.mean([profile['wind_speed'] for profile in profiles], axis=0),
+        'irradiance': np.mean([profile['irradiance'] for profile in profiles], axis=0),
+    }
+
+
+def build_typical_weather_profiles(hourly_weather_df):
+    seasonal_months = [
+        ('Summer', [6, 7, 8]),
+        ('Winter', [12, 1, 2]),
+        ('Spring/Autumn', [3, 4, 5, 9, 10, 11]),
+    ]
+    fallback_profiles = {p['label']: p for p in get_synthetic_weather_profiles()}
+    profiles = []
+
+    weather_df = hourly_weather_df.copy()
+    weather_df['timestamp'] = pd.to_datetime(weather_df['time'])
+    weather_df['month'] = weather_df['timestamp'].dt.month
+    weather_df['hour'] = weather_df['timestamp'].dt.hour
+
+    for label, months in seasonal_months:
+        seasonal_df = weather_df[weather_df['month'].isin(months)]
+        if seasonal_df.empty:
+            profiles.append(fallback_profiles[label])
+            continue
+
+        hourly_average = (
+            seasonal_df.groupby('hour')[['wind_speed_10m', 'shortwave_radiation']]
+            .mean()
+            .reindex(range(24))
+            .interpolate(limit_direction='both')
+            .fillna(0.0)
+        )
+        profiles.append({
+            'label': label,
+            'wind_speed': hourly_average['wind_speed_10m'].to_numpy(dtype=float),
+            'irradiance': np.clip(hourly_average['shortwave_radiation'].to_numpy(dtype=float), 0.0, None),
+        })
+
+    return profiles
+
+
+@st.cache_data(show_spinner=False, ttl=24 * 3600)
+def fetch_json(url, params):
+    request_url = f"{url}?{urlencode(params)}"
+    with urlopen(request_url, timeout=30) as response:
+        return json.loads(response.read().decode('utf-8'))
+
+
+@st.cache_data(show_spinner=False, ttl=24 * 3600)
+def fetch_last_year_typical_weather(location_query):
+    target_year = date.today().year - 1
+    geo_data = fetch_json(
+        'https://geocoding-api.open-meteo.com/v1/search',
+        {'name': location_query, 'count': 1, 'language': 'en', 'format': 'json'},
+    )
+    if not geo_data.get('results'):
+        raise ValueError(f"No location match found for '{location_query}'.")
+
+    location = geo_data['results'][0]
+    archive_data = fetch_json(
+        'https://archive-api.open-meteo.com/v1/archive',
+        {
+            'latitude': location['latitude'],
+            'longitude': location['longitude'],
+            'start_date': f'{target_year}-01-01',
+            'end_date': f'{target_year}-12-31',
+            'hourly': 'wind_speed_10m,shortwave_radiation',
+            'timezone': 'auto',
+        },
+    )
+    hourly = archive_data.get('hourly', {})
+    if not hourly or 'time' not in hourly:
+        raise ValueError('Historical weather data is unavailable for the selected location.')
+
+    hourly_weather_df = pd.DataFrame({
+        'time': hourly['time'],
+        'wind_speed_10m': hourly.get('wind_speed_10m', []),
+        'shortwave_radiation': hourly.get('shortwave_radiation', []),
+    })
+    if hourly_weather_df.empty or len(hourly_weather_df) < 24:
+        raise ValueError('Insufficient hourly weather data returned by the weather service.')
+
+    return {
+        'location_label': ', '.join(filter(None, [
+            location.get('name'),
+            location.get('admin1'),
+            location.get('country'),
+        ])),
+        'latitude': location['latitude'],
+        'longitude': location['longitude'],
+        'source': 'Open-Meteo historical archive',
+        'year': target_year,
+        'profiles': build_typical_weather_profiles(hourly_weather_df),
+    }
+
+
+def load_custom_typical_days(df=None, custom_weights=None, show_warnings=True, weather_profiles=None):
     """
     Build representative daily load profiles (electricity + gas) from
     an uploaded CSV, or fall back to three synthetic typical days.
     Wind / solar generation profiles are embedded separately.
     """
     rep_days = []
+    weather_defaults = weather_profiles if weather_profiles else get_synthetic_weather_profiles()
 
     if df is not None:
         num_days = len(df) // 24
+        average_weather_profile = get_average_weather_profile(weather_defaults)
         for i in range(num_days):
             day_data = df.iloc[i * 24 : (i + 1) * 24]
+            weather_profile = (
+                average_weather_profile
+                if num_days == 1
+                else get_weather_profile_by_index(weather_defaults, i)
+            )
 
             if 'elec_load' in df.columns:
                 elec_load = day_data['elec_load'].values.astype(float)
@@ -585,19 +730,15 @@ def load_custom_typical_days(df=None, custom_weights=None, show_warnings=True):
                 wind_speed = day_data['wind_speed'].values.astype(float)
             else:
                 if show_warnings:
-                    st.warning("Column 'wind_speed' not found — using default wind-speed profile.")
-                t = np.arange(24)
-                wind_speed = 6 + 2 * np.sin((t - 4) * np.pi / 12)
+                    st.warning("Column 'wind_speed' not found — using default weather wind-speed profile.")
+                wind_speed = weather_profile['wind_speed']
 
             if 'irradiance' in df.columns:
                 irradiance = day_data['irradiance'].values.astype(float)
             else:
                 if show_warnings:
-                    st.warning("Column 'irradiance' not found — using default irradiance profile.")
-                irradiance = np.array([
-                    0, 0, 0, 0, 20, 100, 250, 450, 700, 900, 1000, 1050,
-                    1050, 980, 850, 650, 400, 180, 60, 10, 0, 0, 0, 0,
-                ], dtype=float)
+                    st.warning("Column 'irradiance' not found — using default weather irradiance profile.")
+                irradiance = weather_profile['irradiance']
 
             weight = custom_weights[i] if custom_weights and i < len(custom_weights) else 365 // num_days
             rep_days.append({
@@ -611,34 +752,28 @@ def load_custom_typical_days(df=None, custom_weights=None, show_warnings=True):
         # Synthetic three-day profiles
         weights = custom_weights if custom_weights else [90, 90, 185]
         t = np.arange(24)
+        summer_weather = get_weather_profile_by_index(weather_defaults, 0)
+        winter_weather = get_weather_profile_by_index(weather_defaults, 1)
+        shoulder_weather = get_weather_profile_by_index(weather_defaults, 2)
         rep_days.append({
             'elec_load': 1200 + 400 * np.sin((t - 8)  * np.pi / 12),
             'gas_load':  200  +  50 * np.random.rand(24),
-            'wind_speed': 7 + 2.5 * np.sin((t - 3) * np.pi / 12),
-            'irradiance': np.array([
-                0, 0, 0, 0, 20, 100, 250, 450, 700, 900, 1000, 1050,
-                1050, 980, 850, 650, 400, 180, 60, 10, 0, 0, 0, 0,
-            ], dtype=float),
+            'wind_speed': summer_weather['wind_speed'],
+            'irradiance': summer_weather['irradiance'],
             'weight':    weights[0] if len(weights) > 0 else 90,
         })
         rep_days.append({
             'elec_load': 800  + 200 * np.sin((t - 6)  * np.pi / 12),
             'gas_load':  2000 + 800 * np.cos((t - 12) * np.pi / 12),
-            'wind_speed': 9 + 3.0 * np.sin((t + 1) * np.pi / 12),
-            'irradiance': np.array([
-                0, 0, 0, 0, 15, 80, 200, 380, 620, 820, 900, 950,
-                950, 900, 760, 560, 320, 130, 40, 5, 0, 0, 0, 0,
-            ], dtype=float),
+            'wind_speed': winter_weather['wind_speed'],
+            'irradiance': winter_weather['irradiance'],
             'weight':    weights[1] if len(weights) > 1 else 90,
         })
         rep_days.append({
             'elec_load': 900  + 150 * np.sin(t / 4),
             'gas_load':  600  + 100 * np.random.rand(24),
-            'wind_speed': 8 + 2.0 * np.cos((t - 2) * np.pi / 12),
-            'irradiance': np.array([
-                0, 0, 0, 0, 18, 90, 220, 410, 660, 860, 960, 1010,
-                1010, 940, 800, 600, 350, 150, 50, 8, 0, 0, 0, 0,
-            ], dtype=float),
+            'wind_speed': shoulder_weather['wind_speed'],
+            'irradiance': shoulder_weather['irradiance'],
             'weight':    weights[2] if len(weights) > 2 else 185,
         })
     return rep_days
@@ -673,7 +808,28 @@ def render_pre_run_preview(rep_days, solar_efficiency):
     st.pyplot(fig_load)
     plt.close(fig_load)
 
-    # Figure 2: wind and solar generation preview under a fixed reference capacity
+    # Figure 2: weather input curves used by the model
+    fig_weather, (ax_wind, ax_irr) = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
+    for i, day in enumerate(rep_days, start=1):
+        ax_wind.plot(hours, day['wind_speed'], linewidth=2, label=f"Day {i} 10 m Wind Speed")
+        ax_irr.plot(hours, day['irradiance'], linewidth=2, label=f"Day {i} Surface Irradiance")
+
+    ax_wind.set_title("Typical Daily 10 m Wind Speed Input (m/s)")
+    ax_wind.set_ylabel("Wind Speed (m/s)")
+    ax_wind.grid(alpha=0.25)
+    ax_wind.legend(ncol=2, fontsize=8)
+
+    ax_irr.set_title("Typical Daily Surface Irradiance Input (W/m²)")
+    ax_irr.set_xlabel("Hour")
+    ax_irr.set_ylabel("Irradiance (W/m²)")
+    ax_irr.set_xticks(np.arange(0, 24, 2))
+    ax_irr.grid(alpha=0.25)
+    ax_irr.legend(ncol=2, fontsize=8)
+    fig_weather.tight_layout()
+    st.pyplot(fig_weather)
+    plt.close(fig_weather)
+
+    # Figure 3: wind and solar generation preview under a fixed reference capacity
     fig_gen, ax_gen = plt.subplots(figsize=(10, 4))
     eta = max(float(solar_efficiency), 1e-6)
     pv_land_utilization = min(1.0, 1000.0 / (eta * 5.0 * preview_optimizer.acre_to_m2))
@@ -713,8 +869,38 @@ with st.sidebar:
         "Customer Hourly Load Profile",
         type=['csv', 'xlsx'],
     )
+    st.caption("If weather columns are missing, the app can use fetched default climate profiles for the chosen location.")
+    weather_location_query = st.text_input(
+        "Weather location (city or place)",
+        value=st.session_state.get('weather_location_query', ''),
+        help="Used to fetch last year's 10 m wind speed and surface irradiance as default weather data.",
+    )
+    fetch_weather_btn = st.button("🌤️ Fetch Last-Year Weather Defaults", use_container_width=True)
     df_customer   = None
     custom_weights = []
+
+    if fetch_weather_btn:
+        if not weather_location_query.strip():
+            st.error("Please enter a city or location before fetching weather data.")
+        else:
+            with st.spinner("Fetching historical weather data and building typical-day weather profiles..."):
+                try:
+                    weather_payload = fetch_last_year_typical_weather(weather_location_query.strip())
+                    st.session_state['weather_defaults'] = weather_payload
+                    st.session_state['weather_location_query'] = weather_location_query.strip()
+                    st.success(
+                        f"Weather defaults loaded for {weather_payload['location_label']} "
+                        f"using {weather_payload['year']} historical data."
+                    )
+                except Exception as exc:
+                    st.error(f"Unable to fetch weather defaults: {exc}")
+
+    if 'weather_defaults' in st.session_state:
+        weather_info = st.session_state['weather_defaults']
+        st.info(
+            f"Default weather source: {weather_info['location_label']} | "
+            f"{weather_info['source']} | {weather_info['year']}"
+        )
 
     if uploaded_file is not None:
         if uploaded_file.name.endswith('.xlsx'):
@@ -803,9 +989,15 @@ with st.sidebar:
 # Show a "Generate Chart" button after sidebar configuration.
 # Charts are only rendered when the user explicitly requests them,
 # rather than being drawn automatically on every page reload.
+default_weather_profiles = st.session_state.get('weather_defaults', {}).get('profiles')
 preview_btn = st.button("📊 Generate Preview Charts", use_container_width=True)
 if preview_btn:
-    rep_days_preview = load_custom_typical_days(df_customer, custom_weights, show_warnings=True)
+    rep_days_preview = load_custom_typical_days(
+        df_customer,
+        custom_weights,
+        show_warnings=True,
+        weather_profiles=default_weather_profiles,
+    )
     render_pre_run_preview(rep_days_preview, solar_efficiency)
 
 # ==========================================
@@ -828,7 +1020,11 @@ if run_btn or ('report_cache' in st.session_state):
             st.stop()
 
         # ---- Load data ----
-        rep_days          = load_custom_typical_days(df_customer, custom_weights)
+        rep_days = load_custom_typical_days(
+            df_customer,
+            custom_weights,
+            weather_profiles=default_weather_profiles,
+        )
         # Max wind/solar are fully determined by site acreage.
         effective_max_turbines = site_max_turbines
         effective_max_solar    = site_max_solar
