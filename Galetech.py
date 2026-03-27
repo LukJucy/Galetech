@@ -7,6 +7,7 @@ import numpy_financial as npf
 import io
 import json
 from datetime import date
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import urlopen
 
@@ -22,6 +23,7 @@ class GaletechAssetOptimizer:
         self.project_life_years = 20
         self.discount_rate = 0.10
         self.acre_to_m2 = 4046.8564224
+        self._warned_solver_exceptions = set()
 
         self.turbine_models = {
             "None":        {"mw": 0,    "curve": [0]*13,                                                          "equip_cost": 0,       "civil_cost": 0},
@@ -75,10 +77,19 @@ class GaletechAssetOptimizer:
     # ------------------------------------------------------------------
     # OPEX calculation
     # ------------------------------------------------------------------
-    def get_opex(self, total_capex):
+    def get_opex(self, total_capex, t_count=0, s_mw=0):
         insurance   = total_capex * self.params['insurance_rate']
         maintenance = total_capex * self.params['maintenance_rate']
-        lease       = self.params['land_lease']
+        lease_base  = self.params['land_lease']
+        site_area_acre = float(self.params.get('site_area_acre', 0.0) or 0.0)
+        if site_area_acre > 0:
+            # Lease scales with utilized site share under the same land rule used by constraints.
+            max_units = site_area_acre / 5.0
+            used_units = max(0.0, t_count / 2.0 + s_mw)
+            lease_share = min(1.0, used_units / max_units) if max_units > 0 else 1.0
+            lease = lease_base * lease_share
+        else:
+            lease = lease_base
         eboiler_fixed_opex = self.params.get('eboiler_fixed_opex', 15000) if self.params.get('enable_e_boiler', True) else 0
         return insurance + maintenance + lease + eboiler_fixed_opex, insurance, maintenance, lease + eboiler_fixed_opex
 
@@ -115,21 +126,19 @@ class GaletechAssetOptimizer:
             if b_mwh > 0 else 0.0
         )
 
-        carbon_credit_share = self.params.get('carbon_credit_share', 0.5)
+        carbon_credit_share = self.params.get('carbon_credit_share', 1.0)
         grid_carbon_factor  = self.params.get('grid_carbon_factor', 0.35)  # kg CO2 per kWh_e
         eboiler_enabled  = self.params.get('enable_e_boiler', True)
         eboiler_eff      = self.params.get('eboiler_eff', 0.95)
         eboiler_var_cost = self.params.get('eboiler_var_cost', 0.008)   # €/kWh_th
+        p_heat_sell      = self.params.get('p_heat_sell', 0.04)         # €/kWh_th
+        p_grid_buy_price = self.params.get('p_grid_buy', self.params.get('p_galetech', 0.10) * 1.2)
         eboiler_max_kw   = self.params.get('eboiler_max_kw', 1e6) if eboiler_kw is None else eboiler_kw
 
         export_limit_kw   = self.params.get('export_limit_kw', 5000)
         grid_buy_limit_kw = self.params.get('grid_buy_limit_kw', 5000)
         bess_max_power_kw = (b_mwh * 1000) * 0.5 if b_mwh > 0 else 0.0
         cap_kwh           = b_mwh * 1000
-
-        # Grid buy price is intentionally higher than sell price so the
-        # LP never simultaneously buys and sells (no Big-M needed).
-        p_grid_buy_price = self.params['p_sell'] * 1.2   # 20 % premium over export price
 
         all_traces = []
 
@@ -140,11 +149,12 @@ class GaletechAssetOptimizer:
             p_ch           = cp.Variable(T, nonneg=True)   # BESS charge (kW)
             p_dis          = cp.Variable(T, nonneg=True)   # BESS discharge (kW)
             soc            = cp.Variable(T, nonneg=True)   # BESS state of charge (kWh)
-            p_btm_supply   = cp.Variable(T, nonneg=True)   # electricity served to site (kW)
+            p_site_supply  = cp.Variable(T, nonneg=True)   # project electricity served to customer electric load (kW)
+            p_cust_grid    = cp.Variable(T, nonneg=True)   # customer direct grid backup purchase (kW)
             p_eboiler_elec = cp.Variable(T, nonneg=True)   # electricity into e-boiler (kW)
             p_gas_used     = cp.Variable(T, nonneg=True)   # gas heat still consumed (kWh_th)
             p_grid_sell    = cp.Variable(T, nonneg=True)   # export to grid (kW)
-            p_grid_buy     = cp.Variable(T, nonneg=True)   # import from grid (kW)
+            p_grid_buy_proj = cp.Variable(T, nonneg=True)  # project-side grid import for BESS charging (kW)
             p_curtail      = cp.Variable(T, nonneg=True)   # curtailed renewable (kW)
 
             # ---- generation profiles (from hourly wind speed & irradiance) ----
@@ -157,6 +167,7 @@ class GaletechAssetOptimizer:
                 # Area-based PV model using absolute irradiance (W/m^2).
                 # Land rule: 5 acres per 1 MW PV -> area scales with installed MW.
                 irr_wm2 = np.clip(day['irradiance'], 0.0, 1400.0)
+                
                 solar_land_area_m2 = s_mw * 5.0 * self.acre_to_m2
 
                 # Effective panel-covered fraction of land area.
@@ -177,19 +188,24 @@ class GaletechAssetOptimizer:
 
             # ---- constraints ----
             constraints = [
-                # (C1) Site energy balance: all supply = all demand
-                p_wind + p_solar + p_dis + p_grid_buy
-                    == p_btm_supply + p_grid_sell + p_ch + p_curtail,
+                # (C1) Project energy balance: project generation/discharge serves
+                # customer load, e-boiler demand, battery charging and grid export.
+                p_wind + p_solar + p_dis + p_grid_buy_proj
+                    == p_site_supply + p_eboiler_elec + p_grid_sell + p_ch + p_curtail,
 
-                # (C2) p_btm_supply exactly covers electricity load + e-boiler input
-                p_btm_supply == day['elec_load'] + p_eboiler_elec,
+                # (C2) Customer electric load split:
+                # project supply + customer direct grid purchase = customer demand.
+                p_site_supply + p_cust_grid == day['elec_load'],
 
                 # (C3) Heat balance: e-boiler heat + gas = total gas-heat demand
                 eboiler_eff * p_eboiler_elec + p_gas_used == day['gas_load'],
 
                 # (C4) Grid limits (no Big-M; price spread prevents simultaneous buy+sell)
                 p_grid_sell <= export_limit_kw,
-                p_grid_buy  <= grid_buy_limit_kw,
+                # Customer direct grid backup is limited by import capacity.
+                p_cust_grid <= grid_buy_limit_kw,
+                # Project grid import and customer backup share the same import headroom.
+                p_cust_grid + p_grid_buy_proj <= grid_buy_limit_kw,
 
                 # (C5) Curtailment cannot exceed available renewable generation
                 p_curtail <= p_wind + p_solar,
@@ -218,23 +234,27 @@ class GaletechAssetOptimizer:
                     # Power limits
                     p_ch  <= bess_max_power_kw,
                     p_dis <= bess_max_power_kw,
+                    # Project grid import is only allowed for battery charging.
+                    p_grid_buy_proj <= p_ch,
                 ]
                 for t in range(1, T):
                     constraints.append(
                         soc[t] == soc[t - 1] + p_ch[t] * self.bess_eff - p_dis[t] / self.bess_eff
                     )
             else:
-                constraints += [p_ch == 0, p_dis == 0, soc == 0]
+                constraints += [p_ch == 0, p_dis == 0, soc == 0, p_grid_buy_proj == 0]
 
             # ---- objective ----
             # Galetech revenue streams
-            rev_customer = cp.sum(day['elec_load'] * (self.params['p_galetech'] * ppa_shock))
+            # Only electricity physically supplied by the project to customer load is billed at PPA price.
+            rev_customer = cp.sum(p_site_supply * (self.params['p_galetech'] * ppa_shock))
+            rev_heat     = cp.sum(eboiler_eff * p_eboiler_elec * p_heat_sell)
             rev_grid     = cp.sum(p_grid_sell * self.params['p_sell'])
 
             # Galetech cost streams
             # NOTE: gas purchase cost and carbon cost are borne by the CUSTOMER, not Galetech.
             # They are therefore excluded from Galetech's financial objective.
-            grid_purchase_cost = cp.sum(p_grid_buy * p_grid_buy_price)
+            grid_purchase_cost = cp.sum(p_grid_buy_proj * p_grid_buy_price)
             eboiler_cost       = cp.sum(eboiler_eff * p_eboiler_elec * eboiler_var_cost)
             bess_degradation   = cp.sum(p_dis * bess_wear_cost)
 
@@ -247,11 +267,7 @@ class GaletechAssetOptimizer:
                 * self.gas_carbon_factor
                 / 1000
             )
-            grid_co2_saved_t = (
-                (cp.sum(day['elec_load']) - cp.sum(p_grid_buy))
-                * grid_carbon_factor
-                / 1000
-            )
+            grid_co2_saved_t = cp.sum(p_site_supply) * grid_carbon_factor / 1000
             carbon_credit = (
                 carbon_credit_share
                 * self.params['p_carbon']
@@ -259,7 +275,7 @@ class GaletechAssetOptimizer:
             )
 
             obj  = cp.Maximize(
-                rev_customer + rev_grid
+                rev_customer + rev_heat + rev_grid
                 - grid_purchase_cost
                 - eboiler_cost
                 - bess_degradation
@@ -279,11 +295,11 @@ class GaletechAssetOptimizer:
                         * self.gas_carbon_factor / 1000
                     )
                     grid_co2_saved = (
-                        (np.sum(day['elec_load']) - np.sum(p_grid_buy.value))
+                        np.sum(p_site_supply.value)
                         * grid_carbon_factor / 1000
                     )
                     annual_co2_saved      += (gas_co2_saved + grid_co2_saved) * w
-                    annual_btm_supply_kwh += np.sum(p_btm_supply.value) * w
+                    annual_btm_supply_kwh += np.sum(p_site_supply.value) * w
                     annual_heat_from_elec += np.sum(eboiler_eff * p_eboiler_elec.value) * w
                     annual_gas_used_kwh   += np.sum(p_gas_used.value) * w
                     annual_curtailed_kwh  += np.sum(p_curtail.value) * w
@@ -303,9 +319,11 @@ class GaletechAssetOptimizer:
                                 "BESS_Discharge_kW": p_dis.value[t] if b_mwh > 0 else 0,
                                 "EBoiler_Elec_kW": p_eboiler_elec.value[t],
                                 "Gas_Used_kWth":   p_gas_used.value[t],
-                                "BTM_Supply_kW":   p_btm_supply.value[t],
+                                "BTM_Supply_kW":   p_site_supply.value[t],
+                                "Customer_Grid_Backup_kW": p_cust_grid.value[t],
                                 "Grid_Export_kW":  p_grid_sell.value[t],
-                                "Grid_Import_kW":  p_grid_buy.value[t],
+                                "Grid_Import_kW":  p_cust_grid.value[t] + p_grid_buy_proj.value[t],
+                                "Project_Grid_Import_for_BESS_kW": p_grid_buy_proj.value[t],
                                 "Curtailed_kW":    p_curtail.value[t],
                             })
                 else:
@@ -325,11 +343,11 @@ class GaletechAssetOptimizer:
                             f"- Avg elec demand: {avg_demand:.1f} kW\n"
                             f"- Max gas demand: {max_gas_demand:.0f} kWth (→ {max_gas_demand * eboiler_eff / 1000:.1f} kW electric equiv.)\n"
                             f"- Available renewable (wind+solar): {max_avail_renewable:.0f} kW\n"
-                            f"- Grid import limit: {grid_buy_limit_kw:.0f} kW\n\n"
+                            f"- Customer grid backup limit: {grid_buy_limit_kw:.0f} kW\n\n"
                             f"**Likely causes:**\n"
                             f"1) 🔋 Battery size too small: Increase BESS capacity\n"
                             f"2) 💨 Insufficient renewable: Increase turbines or solar MW\n"
-                            f"3) 🔌 Grid import limit too tight: Check 'export_limit_kw' parameter\n"
+                            f"3) 🔌 Customer grid backup limit too tight: Check 'grid_buy_limit_kw' parameter\n"
                             f"4) 🔥 Heating demand too high: Reduce 'eboiler_eff' or add gas boiler capacity\n"
                             f"5) ⚡ E-boiler max power too low: Increase 'eboiler_max_kw'\n\n"
                             f"Config: {t_model} ×{t_count}, Solar={s_mw} MW, BESS={b_mwh} MWh"
@@ -340,7 +358,11 @@ class GaletechAssetOptimizer:
                             f"Config: {t_model} ×{t_count}, Solar={s_mw} MW, BESS={b_mwh} MWh"
                         )
             except Exception as e:
-                st.warning(f"Day {day_idx + 1}: solver exception — {e}")
+                # Avoid spamming repeated identical exception lines across many candidate configs.
+                err_msg = f"Day {day_idx + 1}: solver exception — {e}"
+                if err_msg not in self._warned_solver_exceptions:
+                    st.warning(err_msg)
+                    self._warned_solver_exceptions.add(err_msg)
 
         # Safety: always return the correct type
         if return_traces:
@@ -409,7 +431,7 @@ class GaletechAssetOptimizer:
                                 continue
 
                             capex, _, _, _, _ = self.get_capex(t_model, t_count, s, b, eboiler_kw=e_kw)
-                            annual_opex, _, _, _ = self.get_opex(capex)
+                            annual_opex, _, _, _ = self.get_opex(capex, t_count=t_count, s_mw=s)
                             out = self.evaluate_combination(t_model, t_count, s, b, rep_days, eboiler_kw=e_kw)
 
                             # Robust handling of return value
@@ -423,11 +445,12 @@ class GaletechAssetOptimizer:
                             irr     = npf.irr([-capex] + [net_profit] * self.project_life_years) if net_profit > 0 else 0.0
                             npv     = npf.npv(self.discount_rate, [-capex] + [net_profit] * self.project_life_years)
                             payback = capex / net_profit if net_profit > 0 else 99.0
-                            # Customer/Developer benefit split under carbon-credit sharing.
-                            carbon_share = self.params.get('carbon_credit_share', 0.5)
-                            cust_gas_savings_k      = heat_elec * self.params['p_gas'] / 1e3
+                            # Carbon credit is fully retained by the energy system.
+                            carbon_share = self.params.get('carbon_credit_share', 1.0)
+                            heat_sales_k = heat_elec * self.params.get('p_heat_sell', 0.0) / 1e3
+                            cust_gas_savings_k = heat_elec * (self.params['p_gas'] - self.params.get('p_heat_sell', 0.0)) / 1e3
                             galetech_carbon_credit_k = co2 * self.params['p_carbon'] * carbon_share / 1e3
-                            cust_carbon_savings_k   = co2 * self.params['p_carbon'] * (1 - carbon_share) / 1e3
+                            cust_carbon_savings_k = co2 * self.params['p_carbon'] * (1 - carbon_share) / 1e3
 
                             stage1_results.append({
                                 'Turbine':                  f"{t_count}x {t_model}" if t_count > 0 else 'No Wind',
@@ -448,6 +471,7 @@ class GaletechAssetOptimizer:
                                 'Gas_Used_MWh':             gas_used / 1000,
                                 'Curtailed_MWh':            curt / 1000,
                                 'Min_Elec_PPA':             0.0,
+                                'Heat_Sales_k':             heat_sales_k,
                                 'Galetech_Carbon_Credit_k': galetech_carbon_credit_k,
                                 'Cust_Gas_Savings_k':       cust_gas_savings_k,
                                 'Cust_Carbon_Savings_k':    cust_carbon_savings_k,
@@ -496,7 +520,7 @@ class GaletechAssetOptimizer:
         final_results = []
         for t_model, t_count, s, b, e_kw in candidates:
             capex, _, _, _, _ = self.get_capex(t_model, t_count, s, b, eboiler_kw=e_kw)
-            annual_opex, _, _, _ = self.get_opex(capex)
+            annual_opex, _, _, _ = self.get_opex(capex, t_count=t_count, s_mw=s)
             out = self.evaluate_combination(t_model, t_count, s, b, rep_days, eboiler_kw=e_kw)
             
             # Robust handling of return value
@@ -510,11 +534,12 @@ class GaletechAssetOptimizer:
             irr     = npf.irr([-capex] + [net_profit] * self.project_life_years) if net_profit > 0 else 0.0
             npv     = npf.npv(self.discount_rate, [-capex] + [net_profit] * self.project_life_years)
             payback = capex / net_profit if net_profit > 0 else 99.0
-            # Customer/Developer benefit split under carbon-credit sharing.
-            carbon_share = self.params.get('carbon_credit_share', 0.5)
-            cust_gas_savings_k       = heat_elec * self.params['p_gas'] / 1e3
+            # Carbon credit is fully retained by the energy system.
+            carbon_share = self.params.get('carbon_credit_share', 1.0)
+            heat_sales_k = heat_elec * self.params.get('p_heat_sell', 0.0) / 1e3
+            cust_gas_savings_k = heat_elec * (self.params['p_gas'] - self.params.get('p_heat_sell', 0.0)) / 1e3
             galetech_carbon_credit_k = co2 * self.params['p_carbon'] * carbon_share / 1e3
-            cust_carbon_savings_k    = co2 * self.params['p_carbon'] * (1 - carbon_share) / 1e3
+            cust_carbon_savings_k = co2 * self.params['p_carbon'] * (1 - carbon_share) / 1e3
 
             final_results.append({
                 'Turbine':                  f"{t_count}x {t_model}" if t_count > 0 else 'No Wind',
@@ -535,6 +560,7 @@ class GaletechAssetOptimizer:
                 'Gas_Used_MWh':             gas_used / 1000,
                 'Curtailed_MWh':            curt / 1000,
                 'Min_Elec_PPA':             0.0,
+                'Heat_Sales_k':             heat_sales_k,
                 'Galetech_Carbon_Credit_k': galetech_carbon_credit_k,
                 'Cust_Gas_Savings_k':       cust_gas_savings_k,
                 'Cust_Carbon_Savings_k':    cust_carbon_savings_k,
@@ -621,7 +647,7 @@ def build_typical_weather_profiles(hourly_weather_df):
             continue
 
         hourly_average = (
-            seasonal_df.groupby('hour')[['wind_speed_10m', 'shortwave_radiation']]
+            seasonal_df.groupby('hour')[['wind_speed_10m', 'irradiance']]
             .mean()
             .reindex(range(24))
             .interpolate(limit_direction='both')
@@ -630,7 +656,7 @@ def build_typical_weather_profiles(hourly_weather_df):
         profiles.append({
             'label': label,
             'wind_speed': hourly_average['wind_speed_10m'].to_numpy(dtype=float),
-            'irradiance': np.clip(hourly_average['shortwave_radiation'].to_numpy(dtype=float), 0.0, None),
+            'irradiance': np.clip(hourly_average['irradiance'].to_numpy(dtype=float), 0.0, None),
         })
 
     return profiles
@@ -639,12 +665,32 @@ def build_typical_weather_profiles(hourly_weather_df):
 @st.cache_data(show_spinner=False, ttl=24 * 3600)
 def fetch_json(url, params):
     request_url = f"{url}?{urlencode(params)}"
-    with urlopen(request_url, timeout=30) as response:
-        return json.loads(response.read().decode('utf-8'))
+    try:
+        with urlopen(request_url, timeout=30) as response:
+            return json.loads(response.read().decode('utf-8'))
+    except HTTPError as exc:
+        error_body = exc.read().decode('utf-8', errors='replace')
+        try:
+            error_payload = json.loads(error_body)
+            reason = error_payload.get('reason') or error_payload.get('message') or error_body
+        except json.JSONDecodeError:
+            reason = error_body or str(exc)
+        raise ValueError(f"Weather API request failed: {reason}") from exc
+    except URLError as exc:
+        raise ValueError(f"Weather API request failed: {exc.reason}") from exc
 
 
 @st.cache_data(show_spinner=False, ttl=24 * 3600)
-def fetch_last_year_typical_weather(location_query):
+def fetch_last_year_typical_weather(location_query, use_tilted_gti=True):
+    """
+    Fetch typical weather for the previous year from Open-Meteo.
+    
+    Args:
+        location_query: Location name to search for
+        use_tilted_gti: If True, fetch Global Tilted Irradiance (GTI) at 30° tilt,
+                        SE (-45°) + SW (45°) averaged. If False, use horizontal
+                        shortwave radiation (GHI).
+    """
     target_year = date.today().year - 1
     geo_data = fetch_json(
         'https://geocoding-api.open-meteo.com/v1/search',
@@ -654,26 +700,91 @@ def fetch_last_year_typical_weather(location_query):
         raise ValueError(f"No location match found for '{location_query}'.")
 
     location = geo_data['results'][0]
-    archive_data = fetch_json(
-        'https://archive-api.open-meteo.com/v1/archive',
-        {
-            'latitude': location['latitude'],
-            'longitude': location['longitude'],
-            'start_date': f'{target_year}-01-01',
-            'end_date': f'{target_year}-12-31',
-            'hourly': 'wind_speed_10m,shortwave_radiation',
-            'timezone': 'auto',
-        },
-    )
-    hourly = archive_data.get('hourly', {})
-    if not hourly or 'time' not in hourly:
-        raise ValueError('Historical weather data is unavailable for the selected location.')
+    
+    # Option 1: Fetch tilted GTI for SE and SW orientations
+    if use_tilted_gti:
+        try:
+            # Open-Meteo azimuth uses 0° = south, -90° = east, 90° = west.
+            # Therefore SE = -45° and SW = 45°.
+            # Fetch SE panel (azimuth -45°, tilt 30°)
+            archive_se = fetch_json(
+                'https://archive-api.open-meteo.com/v1/archive',
+                {
+                    'latitude': location['latitude'],
+                    'longitude': location['longitude'],
+                    'start_date': f'{target_year}-01-01',
+                    'end_date': f'{target_year}-12-31',
+                    'hourly': 'wind_speed_10m,global_tilted_irradiance',
+                    'tilt': 30,
+                    'azimuth': -45,
+                    'wind_speed_unit': 'ms',
+                    'timezone': 'auto',
+                },
+            )
+            # Fetch SW panel (azimuth 45°, tilt 30°)
+            archive_sw = fetch_json(
+                'https://archive-api.open-meteo.com/v1/archive',
+                {
+                    'latitude': location['latitude'],
+                    'longitude': location['longitude'],
+                    'start_date': f'{target_year}-01-01',
+                    'end_date': f'{target_year}-12-31',
+                    'hourly': 'wind_speed_10m,global_tilted_irradiance',
+                    'tilt': 30,
+                    'azimuth': 45,
+                    'wind_speed_unit': 'ms',
+                    'timezone': 'auto',
+                },
+            )
+            
+            hourly_se = archive_se.get('hourly', {})
+            hourly_sw = archive_sw.get('hourly', {})
+            
+            if not hourly_se or not hourly_sw or 'time' not in hourly_se:
+                raise ValueError('GTI data unavailable; falling back to GHI.')
+            
+            # Average SE and SW irradiance
+            gti_se = np.array(hourly_se.get('global_tilted_irradiance', []))
+            gti_sw = np.array(hourly_sw.get('global_tilted_irradiance', []))
+            irradiance_data = (gti_se + gti_sw) / 2.0
+            
+            hourly_weather_df = pd.DataFrame({
+                'time': hourly_se['time'],
+                'wind_speed_10m': hourly_se.get('wind_speed_10m', []),
+                'irradiance': irradiance_data,
+            })
+            irradiance_source = 'Open-Meteo GTI (SE -45° + SW 45°, 30° tilt, averaged)'
+            
+        except (ValueError, KeyError):
+            # Fallback to horizontal shortwave radiation if GTI unavailable
+            st.warning('GTI data unavailable; using horizontal shortwave radiation instead.')
+            use_tilted_gti = False
+    
+    # Option 2: Fallback to horizontal shortwave radiation (GHI)
+    if not use_tilted_gti:
+        archive_data = fetch_json(
+            'https://archive-api.open-meteo.com/v1/archive',
+            {
+                'latitude': location['latitude'],
+                'longitude': location['longitude'],
+                'start_date': f'{target_year}-01-01',
+                'end_date': f'{target_year}-12-31',
+                'hourly': 'wind_speed_10m,shortwave_radiation',
+                'wind_speed_unit': 'ms',
+                'timezone': 'auto',
+            },
+        )
+        hourly = archive_data.get('hourly', {})
+        if not hourly or 'time' not in hourly:
+            raise ValueError('Historical weather data is unavailable for the selected location.')
 
-    hourly_weather_df = pd.DataFrame({
-        'time': hourly['time'],
-        'wind_speed_10m': hourly.get('wind_speed_10m', []),
-        'shortwave_radiation': hourly.get('shortwave_radiation', []),
-    })
+        hourly_weather_df = pd.DataFrame({
+            'time': hourly['time'],
+            'wind_speed_10m': hourly.get('wind_speed_10m', []),
+            'irradiance': hourly.get('shortwave_radiation', []),
+        })
+        irradiance_source = 'Open-Meteo GHI (horizontal shortwave)'
+    
     if hourly_weather_df.empty or len(hourly_weather_df) < 24:
         raise ValueError('Insufficient hourly weather data returned by the weather service.')
 
@@ -685,7 +796,7 @@ def fetch_last_year_typical_weather(location_query):
         ])),
         'latitude': location['latitude'],
         'longitude': location['longitude'],
-        'source': 'Open-Meteo historical archive',
+        'source': irradiance_source,
         'year': target_year,
         'profiles': build_typical_weather_profiles(hourly_weather_df),
     }
@@ -698,7 +809,12 @@ def load_custom_typical_days(df=None, custom_weights=None, show_warnings=True, w
     Wind / solar generation profiles are embedded separately.
     """
     rep_days = []
-    weather_defaults = weather_profiles if weather_profiles else get_synthetic_weather_profiles()
+    if isinstance(weather_profiles, dict) and 'profiles' in weather_profiles:
+        weather_defaults = weather_profiles.get('profiles', get_synthetic_weather_profiles())
+    elif isinstance(weather_profiles, list):
+        weather_defaults = weather_profiles
+    else:
+        weather_defaults = get_synthetic_weather_profiles()
 
     if df is not None:
         num_days = len(df) // 24
@@ -742,6 +858,7 @@ def load_custom_typical_days(df=None, custom_weights=None, show_warnings=True, w
 
             weight = custom_weights[i] if custom_weights and i < len(custom_weights) else 365 // num_days
             rep_days.append({
+                'label': weather_profile.get('label', f'Day {i + 1}'),
                 'elec_load': elec_load,
                 'gas_load': gas_load,
                 'wind_speed': wind_speed,
@@ -756,6 +873,7 @@ def load_custom_typical_days(df=None, custom_weights=None, show_warnings=True, w
         winter_weather = get_weather_profile_by_index(weather_defaults, 1)
         shoulder_weather = get_weather_profile_by_index(weather_defaults, 2)
         rep_days.append({
+            'label': summer_weather.get('label', 'Summer'),
             'elec_load': 1200 + 400 * np.sin((t - 8)  * np.pi / 12),
             'gas_load':  200  +  50 * np.random.rand(24),
             'wind_speed': summer_weather['wind_speed'],
@@ -763,6 +881,7 @@ def load_custom_typical_days(df=None, custom_weights=None, show_warnings=True, w
             'weight':    weights[0] if len(weights) > 0 else 90,
         })
         rep_days.append({
+            'label': winter_weather.get('label', 'Winter'),
             'elec_load': 800  + 200 * np.sin((t - 6)  * np.pi / 12),
             'gas_load':  2000 + 800 * np.cos((t - 12) * np.pi / 12),
             'wind_speed': winter_weather['wind_speed'],
@@ -770,6 +889,7 @@ def load_custom_typical_days(df=None, custom_weights=None, show_warnings=True, w
             'weight':    weights[1] if len(weights) > 1 else 90,
         })
         rep_days.append({
+            'label': shoulder_weather.get('label', 'Spring/Autumn'),
             'elec_load': 900  + 150 * np.sin(t / 4),
             'gas_load':  600  + 100 * np.random.rand(24),
             'wind_speed': shoulder_weather['wind_speed'],
@@ -783,23 +903,51 @@ def load_custom_typical_days(df=None, custom_weights=None, show_warnings=True, w
 # 3. Streamlit UI
 # ==========================================
 
-def render_pre_run_preview(rep_days, solar_efficiency):
-    """Render pre-optimisation typical-day load and generation preview charts."""
+def render_pre_run_preview(rep_days, solar_efficiency, weather_profiles=None):
+    """Render pre-optimisation typical-day load and generation preview charts.
+
+    Figure 1 (demand): always uses rep_days directly — actual uploaded data if available,
+    otherwise the 3 synthetic seasonal profiles from load_custom_typical_days.
+    Figures 2 & 3 (weather / generation): always show exactly 3 seasonal lines from weather_profiles.
+    """
     if not rep_days:
         return
 
     preview_optimizer = GaletechAssetOptimizer({'solar_efficiency': solar_efficiency})
     hours = np.arange(24)
 
-    st.subheader("Pre-Optimisation Typical Day Preview")
-    st.caption("Renewable output is plotted for a reference capacity: 1 x EWT 1MW turbine + 1 MW solar PV.")
+    # --- Build 3 seasonal weather profiles for Figures 2 & 3 ---
+    if isinstance(weather_profiles, list):
+        profiles = weather_profiles
+    elif isinstance(weather_profiles, dict) and 'profiles' in weather_profiles:
+        profiles = weather_profiles['profiles']
+    else:
+        profiles = get_synthetic_weather_profiles()
 
-    # Figure 1: electricity and heat demand profiles
+    season_days = [
+        {
+            'label':      p.get('label', f'Season {i + 1}'),
+            'wind_speed': p['wind_speed'],
+            'irradiance': p['irradiance'],
+        }
+        for i, p in enumerate(profiles[:3])
+    ]
+
+    st.subheader("Pre-Optimisation Typical Day Preview")
+    st.caption(
+        "Demand chart shows uploaded representative day profiles (or synthetic seasonal profiles if no file is uploaded). "
+        "Weather and generation charts show 3 seasonal profiles (Summer / Winter / Spring-Autumn) "
+        "built from the previous full year's hourly data by seasonal hour-of-day averaging. "
+        "Reference generation: 1 x EWT 1MW turbine + 1 MW solar PV."
+    )
+
+    # Figure 1: electricity and heat demand — use rep_days directly (uploaded data or synthetic fallback)
     fig_load, ax_load = plt.subplots(figsize=(10, 4))
     for i, day in enumerate(rep_days, start=1):
-        ax_load.plot(hours, day['elec_load'], linewidth=2, label=f"Day {i} Electricity Demand")
-        ax_load.plot(hours, day['gas_load'], linestyle='--', linewidth=1.8, label=f"Day {i} Heat Demand")
-    ax_load.set_title("Typical Daily Electricity & Heat Demand (kW)")
+        day_label = day.get('label', f'Day {i}')
+        ax_load.plot(hours, day['elec_load'], linewidth=2, label=f"{day_label} Electricity Demand")
+        ax_load.plot(hours, day['gas_load'], linestyle='--', linewidth=1.8, label=f"{day_label} Heat Demand")
+    ax_load.set_title("Representative Day — Electricity & Heat Demand (kW)")
     ax_load.set_xlabel("Hour")
     ax_load.set_ylabel("Power (kW)")
     ax_load.set_xticks(np.arange(0, 24, 2))
@@ -808,18 +956,18 @@ def render_pre_run_preview(rep_days, solar_efficiency):
     st.pyplot(fig_load)
     plt.close(fig_load)
 
-    # Figure 2: weather input curves used by the model
+    # Figure 2: weather input curves — 3 seasonal lines, no annual average
     fig_weather, (ax_wind, ax_irr) = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
-    for i, day in enumerate(rep_days, start=1):
-        ax_wind.plot(hours, day['wind_speed'], linewidth=2, label=f"Day {i} 10 m Wind Speed")
-        ax_irr.plot(hours, day['irradiance'], linewidth=2, label=f"Day {i} Surface Irradiance")
+    for day in season_days:
+        ax_wind.plot(hours, day['wind_speed'], linewidth=2, label=f"{day['label']} 10 m Wind Speed")
+        ax_irr.plot(hours, day['irradiance'], linewidth=2, label=f"{day['label']} Irradiance (W/m²)")
 
-    ax_wind.set_title("Typical Daily 10 m Wind Speed Input (m/s)")
+    ax_wind.set_title("Seasonal Typical Day — 10 m Wind Speed (m/s)")
     ax_wind.set_ylabel("Wind Speed (m/s)")
     ax_wind.grid(alpha=0.25)
     ax_wind.legend(ncol=2, fontsize=8)
 
-    ax_irr.set_title("Typical Daily Surface Irradiance Input (W/m²)")
+    ax_irr.set_title("Seasonal Typical Day — Tilted Irradiance (W/m²)")
     ax_irr.set_xlabel("Hour")
     ax_irr.set_ylabel("Irradiance (W/m²)")
     ax_irr.set_xticks(np.arange(0, 24, 2))
@@ -829,22 +977,21 @@ def render_pre_run_preview(rep_days, solar_efficiency):
     st.pyplot(fig_weather)
     plt.close(fig_weather)
 
-    # Figure 3: wind and solar generation preview under a fixed reference capacity
+    # Figure 3: seasonal wind & solar reference output — 3 seasonal lines
     fig_gen, ax_gen = plt.subplots(figsize=(10, 4))
     eta = max(float(solar_efficiency), 1e-6)
     pv_land_utilization = min(1.0, 1000.0 / (eta * 5.0 * preview_optimizer.acre_to_m2))
     solar_land_area_m2 = 1.0 * 5.0 * preview_optimizer.acre_to_m2
 
-    for i, day in enumerate(rep_days, start=1):
+    for day in season_days:
         p_wind_ref = preview_optimizer.get_wind_power(day['wind_speed'], "EWT 1MW", count=1, shock_factor=1.0)
         irr_wm2 = np.clip(day['irradiance'], 0.0, 1400.0)
         p_solar_area_kw = irr_wm2 * solar_land_area_m2 * eta * pv_land_utilization / 1000.0
         p_solar_ref = np.minimum(p_solar_area_kw, 1000.0)
+        ax_gen.plot(hours, p_wind_ref, linewidth=2,       label=f"{day['label']} Wind Output")
+        ax_gen.plot(hours, p_solar_ref, linestyle='--', linewidth=1.8, label=f"{day['label']} Solar Output")
 
-        ax_gen.plot(hours, p_wind_ref, linewidth=2, label=f"Day {i} Wind Output")
-        ax_gen.plot(hours, p_solar_ref, linestyle='--', linewidth=1.8, label=f"Day {i} Solar Output")
-
-    ax_gen.set_title("Typical Daily Wind & Solar Reference Output (kW)")
+    ax_gen.set_title("Seasonal Typical Day — Wind & Solar Reference Output (kW)  [1 × EWT 1MW + 1 MW PV]")
     ax_gen.set_xlabel("Hour")
     ax_gen.set_ylabel("Power (kW)")
     ax_gen.set_xticks(np.arange(0, 24, 2))
@@ -869,10 +1016,13 @@ with st.sidebar:
         "Customer Hourly Load Profile",
         type=['csv', 'xlsx'],
     )
-    st.caption("If weather columns are missing, the app can use fetched default climate profiles for the chosen location.")
+    st.caption(
+        "If weather columns are missing, the app can use fetched default climate profiles for the chosen location. "
+        "If no location is selected, Dublin is used by default."
+    )
     weather_location_query = st.text_input(
         "Weather location (city or place)",
-        value=st.session_state.get('weather_location_query', ''),
+        value=st.session_state.get('weather_location_query', 'Dublin'),
         help="Used to fetch last year's 10 m wind speed and surface irradiance as default weather data.",
     )
     fetch_weather_btn = st.button("🌤️ Fetch Last-Year Weather Defaults", use_container_width=True)
@@ -895,11 +1045,36 @@ with st.sidebar:
                 except Exception as exc:
                     st.error(f"Unable to fetch weather defaults: {exc}")
 
+    # Auto-default weather when user has not fetched any location yet.
+    if 'weather_defaults' not in st.session_state:
+        default_location = (st.session_state.get('weather_location_query', 'Dublin') or 'Dublin').strip() or 'Dublin'
+        try:
+            weather_payload = fetch_last_year_typical_weather(default_location)
+            st.session_state['weather_defaults'] = weather_payload
+            st.session_state['weather_location_query'] = default_location
+            st.info(
+                f"No weather location selected/fetched. Using default location: {weather_payload['location_label']} "
+                f"({weather_payload['year']} historical data)."
+            )
+        except Exception:
+            st.session_state['weather_defaults'] = {
+                'location_label': 'Dublin (synthetic fallback)',
+                'source': 'Synthetic seasonal weather profiles',
+                'year': 'N/A',
+                'profiles': get_synthetic_weather_profiles(),
+            }
+            st.session_state['weather_location_query'] = 'Dublin'
+            st.warning(
+                "No weather location selected and live weather fetch is unavailable. "
+                "Using synthetic seasonal profiles with Dublin as the default nominal location."
+            )
+
     if 'weather_defaults' in st.session_state:
         weather_info = st.session_state['weather_defaults']
         st.info(
             f"Default weather source: {weather_info['location_label']} | "
-            f"{weather_info['source']} | {weather_info['year']}"
+            f"{weather_info['source']} | {weather_info['year']} | "
+            f"Representative days built from full-year hourly data by seasonal hour-of-day averaging"
         )
 
     if uploaded_file is not None:
@@ -940,6 +1115,13 @@ with st.sidebar:
                                             min_value=70.0, max_value=100.0, value=95.0) / 100
     eboiler_var_cost_input = st.number_input("Electric boiler variable cost (€/MWh_th)",
                                              min_value=0.0, max_value=200.0, value=8.0)
+    heat_sell_price_input = st.number_input(
+        "Heat sales price from E-boiler (€/MWh_th)",
+        min_value=0.0,
+        max_value=300.0,
+        value=45.0,
+        help="Default set below typical gas price so customer still saves while heat becomes project revenue.",
+    )
 
     st.header("📌 Optimisation Strategy")
     optimization_metric = st.selectbox("Optimisation metric", ["Payback", "IRR", "NPV"], index=0)
@@ -947,7 +1129,7 @@ with st.sidebar:
     with st.expander("🛠️ Advanced CAPEX / OPEX assumptions", expanded=False):
         c_solar_mw       = st.number_input("Solar equipment cost (€/MW)",        value=1_000_000)
         c_bess_mwh       = st.number_input("BESS equipment cost (€/MWh)",         value=300_000)
-        c_eboiler_kw     = st.number_input("E-boiler equipment cost (€/kW_th)",   value=120)
+        c_eboiler_kw     = st.number_input("E-boiler equipment cost (€/kW_e)",    value=120)
         c_eboiler_civil  = st.number_input("E-boiler civils (€/site)",            value=80_000)
         opex_eboiler_fixed = st.number_input("E-boiler fixed OPEX (€/year)",      value=15_000)
         solar_efficiency = st.number_input("Solar panel efficiency (%)",           value=20.0) / 100
@@ -961,7 +1143,7 @@ with st.sidebar:
 
     st.divider()
     st.header("📐 Site & Physical Constraints")
-    site_area_acre = st.number_input("Site area (acres)", min_value=0.0, max_value=5000.0, value=100.0, step=5.0)
+    site_area_acre = st.number_input("Site area (acres)", min_value=0.0, max_value=5000.0, value=15.0, step=5.0)
     site_max_turbines = int((site_area_acre / 5) * 2)
     site_max_solar = int(site_area_acre / 5)
     col1, col2 = st.columns(2)
@@ -989,16 +1171,16 @@ with st.sidebar:
 # Show a "Generate Chart" button after sidebar configuration.
 # Charts are only rendered when the user explicitly requests them,
 # rather than being drawn automatically on every page reload.
-default_weather_profiles = st.session_state.get('weather_defaults', {}).get('profiles')
+default_weather_defaults = st.session_state.get('weather_defaults', {})
 preview_btn = st.button("📊 Generate Preview Charts", use_container_width=True)
 if preview_btn:
     rep_days_preview = load_custom_typical_days(
         df_customer,
         custom_weights,
         show_warnings=True,
-        weather_profiles=default_weather_profiles,
+        weather_profiles=default_weather_defaults,
     )
-    render_pre_run_preview(rep_days_preview, solar_efficiency)
+    render_pre_run_preview(rep_days_preview, solar_efficiency, weather_profiles=default_weather_defaults)
 
 # ==========================================
 # 4. Run optimisation and display results
@@ -1023,7 +1205,7 @@ if run_btn or ('report_cache' in st.session_state):
         rep_days = load_custom_typical_days(
             df_customer,
             custom_weights,
-            weather_profiles=default_weather_profiles,
+            weather_profiles=default_weather_defaults,
         )
         # Max wind/solar are fully determined by site acreage.
         effective_max_turbines = site_max_turbines
@@ -1042,9 +1224,11 @@ if run_btn or ('report_cache' in st.session_state):
         optimizer_params = {
             'p_galetech':        p_galetech_input / 1000,   # €/kWh
             'p_gas':             p_gas_input      / 1000,
+            'p_heat_sell':       heat_sell_price_input / 1000,
+            'p_grid_buy':        p_retail_input   / 1000,
             'p_sell':            p_sell_input     / 1000,
             'p_carbon':          p_carbon_input,
-            'carbon_credit_share': 0.5,
+            'carbon_credit_share': 1.0,
             'grid_carbon_factor':  0.35,
             'enable_e_boiler':   use_e_boiler,
             'eboiler_eff':       eboiler_eff_input,
@@ -1065,6 +1249,7 @@ if run_btn or ('report_cache' in st.session_state):
             'insurance_rate':    ins_rate,
             'maintenance_rate':  maint_rate,
             'land_lease':        lease_cost,
+            'site_area_acre':    site_area_acre,
         }
         optimizer = GaletechAssetOptimizer(optimizer_params)
 
@@ -1087,19 +1272,24 @@ if run_btn or ('report_cache' in st.session_state):
                      "Try relaxing constraints or adjusting prices.")
             st.stop()
 
-        # ---- Filter to viable payback range ----
-        df_viable = df_res[(df_res['Payback'] > 0) & (df_res['Payback'] < optimizer.project_life_years)].copy()
+        # ---- Filter viability by selected optimisation metric ----
         if optimization_metric == "IRR":
+            df_viable = df_res[df_res['IRR'] > 0].copy()
             df_viable = df_viable.sort_values('IRR', ascending=False)
+            viability_label = "positive IRR"
         elif optimization_metric == "NPV":
+            df_viable = df_res[df_res['NPV10_M'] > 0].copy()
             df_viable = df_viable.sort_values('NPV10_M', ascending=False)
+            viability_label = "positive NPV"
         else:
+            df_viable = df_res[(df_res['Payback'] > 0) & (df_res['Payback'] < optimizer.project_life_years)].copy()
             df_viable = df_viable.sort_values('Payback', ascending=True)
+            viability_label = "positive payback within project life"
         df_viable.reset_index(drop=True, inplace=True)
 
         if df_viable.empty:
             st.warning(
-                "No configurations achieved positive payback within project life. "
+                f"No configurations achieved {viability_label}. "
                 "Showing the closest available configuration for diagnostics."
             )
             # Fall back to best available scenario by selected metric.
@@ -1110,7 +1300,7 @@ if run_btn or ('report_cache' in st.session_state):
             else:
                 df_fallback = df_res.sort_values('Payback', ascending=True).reset_index(drop=True)
             best = df_fallback.iloc[0].copy()
-            has_viable_payback = False
+            has_viable_selection = False
             st.info(
                 f"Best available now: Payback={best['Payback']:.1f} yrs, "
                 f"IRR={best['IRR']:.1f}%, NPV={best['NPV10_M']:.2f} M€. "
@@ -1119,13 +1309,13 @@ if run_btn or ('report_cache' in st.session_state):
             )
         else:
             best = df_viable.iloc[0].copy()
-            has_viable_payback = True
+            has_viable_selection = True
 
         # ---- Compute minimum PPA for target IRR ----
         capex, _, _, _, _ = optimizer.get_capex(best['t_model_raw'], best['t_count_raw'],
                                                  best['Solar_MW'], best['BESS_MWh'],
                                                  eboiler_kw=best.get('EBoiler_kW', 0))
-        annual_opex, _, _, _ = optimizer.get_opex(capex)
+        annual_opex, _, _, _ = optimizer.get_opex(capex, t_count=best['t_count_raw'], s_mw=best['Solar_MW'])
         revenue   = best['Profit_k'] * 1000 + annual_opex
         btm_e     = best['Elec_Offset_MWh'] * 1000   # kWh/year
         target_irr = target_irr_input / 100
@@ -1166,7 +1356,7 @@ if run_btn or ('report_cache' in st.session_state):
             'df_res': df_res,
             'df_viable': df_viable,
             'best': best,
-            'has_viable_payback': has_viable_payback,
+            'has_viable_selection': has_viable_selection,
             'df_cashflow': df_cashflow,
             'df_traces': df_traces,
             'csv_data': csv_data,
@@ -1180,7 +1370,7 @@ if run_btn or ('report_cache' in st.session_state):
         df_res = cache['df_res']
         df_viable = cache['df_viable']
         best = cache['best']
-        has_viable_payback = cache['has_viable_payback']
+        has_viable_selection = cache.get('has_viable_selection', True)
         df_cashflow = cache['df_cashflow']
         df_traces = cache['df_traces']
         csv_data = cache['csv_data']
@@ -1193,10 +1383,10 @@ if run_btn or ('report_cache' in st.session_state):
     st.session_state['best_config'] = best
     st.session_state['rep_days'] = rep_days
 
-    if has_viable_payback:
+    if has_viable_selection:
         st.success("✅ Optimisation complete. Bankable report generated.")
     else:
-        st.warning("⚠️ Optimisation complete, but no positive-payback option was found in project life.")
+        st.warning("⚠️ Optimisation complete, but no configuration passed the selected metric's viability threshold.")
 
     # ==========================================
     # 5. Output tabs
@@ -1253,22 +1443,26 @@ if run_btn or ('report_cache' in st.session_state):
         st.markdown("### Customer Decarbonisation & Cost Savings")
         st.caption(
             "Gas purchase and carbon costs are the customer's responsibility. "
-            "Carbon-credit value from avoided emissions is shared 50/50, with "
-            "Galetech receiving 50% as revenue and the customer retaining 50%."
+            "Carbon-credit value from avoided emissions is fully retained by the energy system. "
+            "When E-boiler heat is sold to customer, customer gas saving is shown as net saving "
+            "(avoided gas cost minus purchased heat cost)."
         )
-        carbon_share_ui = optimizer.params.get('carbon_credit_share', 0.5)
+        carbon_share_ui = optimizer.params.get('carbon_credit_share', 1.0)
         cust_gas_sav   = best.get('Cust_Gas_Savings_k', 0.0)    # k€/yr
         galetech_carb_rev = best.get('Galetech_Carbon_Credit_k', 0.0)  # k€/yr
         cust_carb_sav  = best.get('Cust_Carbon_Savings_k', 0.0)  # k€/yr
+        heat_sales_rev = best.get('Heat_Sales_k', 0.0)            # k€/yr
         co2_displaced  = best['CO2_T']                            # tonnes CO2/yr
         heat_displaced = best['Heat_By_EBoiler_MWh']              # MWh_th/yr
 
-        cc1, cc2, cc3, cc4, cc5 = st.columns(5)
+        cc1, cc2, cc3, cc4, cc5, cc6 = st.columns(6)
         cc1.metric("CO₂ displaced",               f"{co2_displaced:,.0f} t/yr")
         cc2.metric("Gas heat displaced",          f"{heat_displaced:,.0f} MWh/yr")
-        cc3.metric("Galetech carbon credit",      f"€ {galetech_carb_rev:,.1f} k/yr")
-        cc4.metric("Customer gas cost saving",    f"€ {cust_gas_sav:,.1f} k/yr")
-        cc5.metric("Customer carbon benefit",     f"€ {cust_carb_sav:,.1f} k/yr")
+        cc3.metric("Heat sales revenue",          f"€ {heat_sales_rev:,.1f} k/yr")
+        cc4.metric("Galetech carbon credit",      f"€ {galetech_carb_rev:,.1f} k/yr")
+        cc5.metric("Customer net heat saving",    f"€ {cust_gas_sav:,.1f} k/yr")
+        cc6.metric("Customer carbon benefit",     f"€ {cust_carb_sav:,.1f} k/yr")
+        st.caption(f"Carbon share to system: {carbon_share_ui * 100:.0f} %")
 
         total_cust_saving = cust_gas_sav + cust_carb_sav
         st.success(
@@ -1285,6 +1479,7 @@ if run_btn or ('report_cache' in st.session_state):
         show_cols = ['Turbine', 'Solar_MW', 'BESS_MWh', 'Payback', 'IRR', 'NPV10_M',
                      'CAPEX_M', 'EBoiler_kW', 'Elec_Offset_MWh', 'Heat_By_EBoiler_MWh',
                      'Gas_Used_MWh', 'Curtailed_MWh',
+                     'Heat_Sales_k',
                      'Galetech_Carbon_Credit_k',
                      'Cust_Gas_Savings_k', 'Cust_Carbon_Savings_k']
         # Only include columns that actually exist (guards against old cached DataFrames)
@@ -1300,6 +1495,7 @@ if run_btn or ('report_cache' in st.session_state):
                 'Heat_By_EBoiler_MWh':    '{:.0f}',
                 'Gas_Used_MWh':           '{:.0f}',
                 'Curtailed_MWh':          '{:.0f}',
+                'Heat_Sales_k':           '{:.1f} k€',
                 'Galetech_Carbon_Credit_k': '{:.1f} k€',
                 'Cust_Gas_Savings_k':     '{:.1f} k€',
                 'Cust_Carbon_Savings_k':  '{:.1f} k€',
@@ -1346,31 +1542,6 @@ if run_btn or ('report_cache' in st.session_state):
             })
         )
 
-        # Heat-maps for best wind model
-        st.subheader("Viability heat-maps (Solar vs BESS, best wind model)")
-        selected_wind = best['t_model_raw']
-        sub = df_res[df_res['t_model_raw'] == selected_wind]
-        if sub.empty:
-            sub = df_res
-
-        for metric, cmap in [('Payback', 'viridis'), ('IRR', 'RdYlGn'), ('NPV10_M', 'coolwarm')]:
-            pivot = sub.pivot_table(index='BESS_MWh', columns='Solar_MW',
-                                    values=metric, aggfunc='mean')
-            if pivot.empty:
-                continue
-            fig, ax = plt.subplots(figsize=(6, 4))
-            im = ax.imshow(pivot.values, aspect='auto', origin='lower', cmap=cmap)
-            ax.set_title(f"{metric} heat-map (wind model = {selected_wind})")
-            ax.set_ylabel('BESS (MWh)')
-            ax.set_xlabel('Solar (MW)')
-            ax.set_xticks(np.arange(pivot.shape[1]))
-            ax.set_xticklabels(pivot.columns.astype(int), rotation=45)
-            ax.set_yticks(np.arange(pivot.shape[0]))
-            ax.set_yticklabels(pivot.index.astype(int))
-            fig.colorbar(im, ax=ax, label=metric)
-            st.pyplot(fig)
-            plt.close(fig)
-
     # ---------- Tab 4: Monte Carlo ----------
     with tab4:
         st.header("Monte Carlo Uncertainty Analysis")
@@ -1389,7 +1560,11 @@ if run_btn or ('report_cache' in st.session_state):
                     best_conf['Solar_MW'], best_conf['BESS_MWh'], capex_shock,
                     eboiler_kw=best_conf.get('EBoiler_kW', 0),
                 )
-                mc_opex, _, _, _ = optimizer.get_opex(mc_capex)
+                mc_opex, _, _, _ = optimizer.get_opex(
+                    mc_capex,
+                    t_count=best_conf['t_count_raw'],
+                    s_mw=best_conf['Solar_MW'],
+                )
 
                 out = optimizer.evaluate_combination(
                     best_conf['t_model_raw'], best_conf['t_count_raw'],
@@ -1430,6 +1605,17 @@ if run_btn or ('report_cache' in st.session_state):
                     st.write(f"- Optimistic (P10): **{p10:.1f} yrs**")
                     st.write(f"- Expected   (P50): **{p50:.1f} yrs**")
                     st.write(f"- Conservative (P90): **{p90:.1f} yrs**")
+                    st.markdown(
+                        """
+**How to interpret these percentiles**
+
+- **P10 (Optimistic)**: 10% of scenarios achieve this payback or better.
+- **P50 (Median)**: Central outcome; half of scenarios are better and half are worse.
+- **P90 (Conservative)**: 90% of scenarios are this value or better; useful for downside planning.
+
+Use the spread between P10 and P90 as a quick risk indicator. A wider gap means higher uncertainty.
+                        """
+                    )
                 with c2:
                     fig, ax = plt.subplots(figsize=(6, 3))
                     ax.hist(df_mc['Payback'], bins=10, color='steelblue', edgecolor='white')
@@ -1439,6 +1625,10 @@ if run_btn or ('report_cache' in st.session_state):
                     ax.legend()
                     st.pyplot(fig)
                     plt.close(fig)
+                    st.caption(
+                        "Histogram guide: each bar shows how many simulations fall into a payback range. "
+                        "The dashed red line marks the median (P50)."
+                    )
 
     # ---------- Tab 5: Auditable Pack ----------
     with tab5:

@@ -42,6 +42,7 @@ This structure provides explicit economic incentive for higher decarbonization p
 ## Main Features
 - Joint sizing of wind, solar, BESS, and electric boiler.
 - Constraint-aware dispatch optimization (grid limits, SOC dynamics, curtailment, heat balance).
+- **Directional solar irradiance adjustment**: Optional feature to account for panel orientation (SE/SW split, 30° tilt) for more realistic PV generation estimates. Enable via `apply_directional_irradiance=True` in params.
 - Pre-optimization preview charts generated on demand.
 - Persistent report behavior: once a report is generated, it remains visible across UI reruns (for example when generating preview charts) until a new optimization run is triggered.
 - Built-in Monte Carlo sensitivity workflow.
