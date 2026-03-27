@@ -93,6 +93,18 @@ class GaletechAssetOptimizer:
         eboiler_fixed_opex = self.params.get('eboiler_fixed_opex', 15000) if self.params.get('enable_e_boiler', True) else 0
         return insurance + maintenance + lease + eboiler_fixed_opex, insurance, maintenance, lease + eboiler_fixed_opex
 
+    def _safe_irr(self, capex, net_profit):
+        """Return IRR with robust fallback for always-negative cashflows.
+
+        If cashflows do not change sign (e.g. all negative), npf.irr returns NaN.
+        In that case we report -100% to reflect clearly non-viable economics,
+        instead of masking the value as 0%.
+        """
+        irr = npf.irr([-capex] + [net_profit] * self.project_life_years)
+        if irr is None or not np.isfinite(irr):
+            return -1.0
+        return float(irr)
+
     # ------------------------------------------------------------------
     # Daily dispatch optimisation (LP, no integer variables)
     #
@@ -133,6 +145,7 @@ class GaletechAssetOptimizer:
         eboiler_var_cost = self.params.get('eboiler_var_cost', 0.008)   # €/kWh_th
         p_heat_sell      = self.params.get('p_heat_sell', 0.04)         # €/kWh_th
         p_grid_buy_price = self.params.get('p_grid_buy', self.params.get('p_galetech', 0.10) * 1.2)
+        p_cust_grid_penalty = self.params.get('p_cust_grid_penalty', 0.0)  # €/kWh, service-quality soft penalty
         eboiler_max_kw   = self.params.get('eboiler_max_kw', 1e6) if eboiler_kw is None else eboiler_kw
 
         export_limit_kw   = self.params.get('export_limit_kw', 5000)
@@ -255,11 +268,12 @@ class GaletechAssetOptimizer:
             # NOTE: gas purchase cost and carbon cost are borne by the CUSTOMER, not Galetech.
             # They are therefore excluded from Galetech's financial objective.
             grid_purchase_cost = cp.sum(p_grid_buy_proj * p_grid_buy_price)
+            customer_grid_penalty_cost = cp.sum(p_cust_grid * p_cust_grid_penalty)
             eboiler_cost       = cp.sum(eboiler_eff * p_eboiler_elec * eboiler_var_cost)
             bess_degradation   = cp.sum(p_dis * bess_wear_cost)
 
             # Carbon credit revenue to Galetech:
-            # 50% (configurable) of monetised CO2 reduction from
+            # monetised CO2 reduction from
             # 1) replacing gas heat demand, and
             # 2) reducing grid electricity imports.
             gas_co2_saved_t = (
@@ -267,7 +281,10 @@ class GaletechAssetOptimizer:
                 * self.gas_carbon_factor
                 / 1000
             )
-            grid_co2_saved_t = cp.sum(p_site_supply) * grid_carbon_factor / 1000
+            # Electricity decarbonisation is credited to net RE displacement of grid power.
+            # Keep this affine in the objective to satisfy DCP rules.
+            net_re_displacement = cp.sum(p_site_supply) - cp.sum(p_grid_buy_proj)
+            grid_co2_saved_t = net_re_displacement * grid_carbon_factor / 1000
             carbon_credit = (
                 carbon_credit_share
                 * self.params['p_carbon']
@@ -277,6 +294,7 @@ class GaletechAssetOptimizer:
             obj  = cp.Maximize(
                 rev_customer + rev_heat + rev_grid
                 - grid_purchase_cost
+                - customer_grid_penalty_cost
                 - eboiler_cost
                 - bess_degradation
                 + carbon_credit
@@ -295,7 +313,7 @@ class GaletechAssetOptimizer:
                         * self.gas_carbon_factor / 1000
                     )
                     grid_co2_saved = (
-                        np.sum(p_site_supply.value)
+                        max(0.0, np.sum(p_site_supply.value) - np.sum(p_grid_buy_proj.value))
                         * grid_carbon_factor / 1000
                     )
                     annual_co2_saved      += (gas_co2_saved + grid_co2_saved) * w
@@ -359,10 +377,10 @@ class GaletechAssetOptimizer:
                         )
             except Exception as e:
                 # Avoid spamming repeated identical exception lines across many candidate configs.
-                err_msg = f"Day {day_idx + 1}: solver exception — {e}"
-                if err_msg not in self._warned_solver_exceptions:
-                    st.warning(err_msg)
-                    self._warned_solver_exceptions.add(err_msg)
+                err_key = str(e)
+                if err_key not in self._warned_solver_exceptions:
+                    st.warning(f"Day {day_idx + 1}: solver exception — {e}")
+                    self._warned_solver_exceptions.add(err_key)
 
         # Safety: always return the correct type
         if return_traces:
@@ -390,6 +408,8 @@ class GaletechAssetOptimizer:
                                site_area_acre,
                                optimization_metric='Payback',
                                min_eboiler_kw=0, max_eboiler_kw=0):
+
+        annual_customer_load_kwh = sum(np.sum(day['elec_load']) * day['weight'] for day in rep_days)
 
         # ---- Stage 1 ----
         t_start = max(min_turbines, 0)
@@ -442,7 +462,7 @@ class GaletechAssetOptimizer:
 
                             revenue, co2, btm_e, heat_elec, gas_used, curt, curt_cost = out
                             net_profit = revenue - annual_opex
-                            irr     = npf.irr([-capex] + [net_profit] * self.project_life_years) if net_profit > 0 else 0.0
+                            irr     = self._safe_irr(capex, net_profit)
                             npv     = npf.npv(self.discount_rate, [-capex] + [net_profit] * self.project_life_years)
                             payback = capex / net_profit if net_profit > 0 else 99.0
                             # Carbon credit is fully retained by the energy system.
@@ -467,6 +487,7 @@ class GaletechAssetOptimizer:
                                 'NPV10_M':                  npv / 1e6,
                                 'CO2_T':                    co2,
                                 'Elec_Offset_MWh':          btm_e / 1000,
+                                'Green_Elec_Share_pct':     (btm_e / annual_customer_load_kwh * 100) if annual_customer_load_kwh > 0 else 0.0,
                                 'Heat_By_EBoiler_MWh':      heat_elec / 1000,
                                 'Gas_Used_MWh':             gas_used / 1000,
                                 'Curtailed_MWh':            curt / 1000,
@@ -531,7 +552,7 @@ class GaletechAssetOptimizer:
                 
             revenue, co2, btm_e, heat_elec, gas_used, curt, curt_cost = out
             net_profit = revenue - annual_opex
-            irr     = npf.irr([-capex] + [net_profit] * self.project_life_years) if net_profit > 0 else 0.0
+            irr     = self._safe_irr(capex, net_profit)
             npv     = npf.npv(self.discount_rate, [-capex] + [net_profit] * self.project_life_years)
             payback = capex / net_profit if net_profit > 0 else 99.0
             # Carbon credit is fully retained by the energy system.
@@ -556,6 +577,7 @@ class GaletechAssetOptimizer:
                 'NPV10_M':                  npv / 1e6,
                 'CO2_T':                    co2,
                 'Elec_Offset_MWh':          btm_e / 1000,
+                'Green_Elec_Share_pct':     (btm_e / annual_customer_load_kwh * 100) if annual_customer_load_kwh > 0 else 0.0,
                 'Heat_By_EBoiler_MWh':      heat_elec / 1000,
                 'Gas_Used_MWh':             gas_used / 1000,
                 'Curtailed_MWh':            curt / 1000,
@@ -1107,6 +1129,13 @@ with st.sidebar:
     )
     p_galetech_input = st.number_input("Target BOO PPA price — electricity (€/MWh)", value=100.0)
     p_sell_input     = st.number_input("Grid export price (€/MWh)",                  value=50.0)
+    cust_grid_penalty_input = st.number_input(
+        "Customer grid-backup penalty (€/MWh)",
+        min_value=0.0,
+        max_value=500.0,
+        value=0.0,
+        help="Optional soft constraint (default 0): use only if you want extra service-priority pressure beyond pure price signals.",
+    )
     p_carbon_input   = st.number_input("Carbon value (€/tonne CO₂)",                 value=65.0)
     target_irr_input = st.number_input("Target IRR for minimum PPA (%)",             value=10.0)
 
@@ -1226,6 +1255,7 @@ if run_btn or ('report_cache' in st.session_state):
             'p_gas':             p_gas_input      / 1000,
             'p_heat_sell':       heat_sell_price_input / 1000,
             'p_grid_buy':        p_retail_input   / 1000,
+            'p_cust_grid_penalty': cust_grid_penalty_input / 1000,
             'p_sell':            p_sell_input     / 1000,
             'p_carbon':          p_carbon_input,
             'carbon_credit_share': 1.0,
@@ -1418,11 +1448,12 @@ if run_btn or ('report_cache' in st.session_state):
             f"**BESS:** {best['BESS_MWh']} MWh"
         )
 
-        c1, c2, c3, c4 = st.columns(4)
+        c1, c2, c3, c4, c5 = st.columns(5)
         c1.metric("Payback period",   f"{best['Payback']:.1f} yrs")
         c2.metric("Project IRR",      f"{best['IRR']:.1f} %")
         c3.metric("NPV @ 10 %",       f"€ {best['NPV10_M']:.2f} M")
         c4.metric("E-boiler size",    f"{int(best.get('EBoiler_kW', 0))} kW")
+        c5.metric("Customer green electricity share", f"{best.get('Green_Elec_Share_pct', 0.0):.1f} %")
 
         st.caption(f"Gas retained for heat: {best['Gas_Used_MWh']:.0f} MWh/yr")
         heat_mode = (
@@ -1445,7 +1476,10 @@ if run_btn or ('report_cache' in st.session_state):
             "Gas purchase and carbon costs are the customer's responsibility. "
             "Carbon-credit value from avoided emissions is fully retained by the energy system. "
             "When E-boiler heat is sold to customer, customer gas saving is shown as net saving "
-            "(avoided gas cost minus purchased heat cost)."
+            "(avoided gas cost minus purchased heat cost). "
+            "Electricity decarbonisation is calculated from net RE displacement of grid power "
+            "(project supply minus project-side grid charging used for BESS). "
+            "Customer-grid-backup penalty is applied as a soft service-priority constraint."
         )
         carbon_share_ui = optimizer.params.get('carbon_credit_share', 1.0)
         cust_gas_sav   = best.get('Cust_Gas_Savings_k', 0.0)    # k€/yr
@@ -1477,7 +1511,7 @@ if run_btn or ('report_cache' in st.session_state):
         st.header("Financial Performance & Breakdown")
         df_table = df_viable if not df_viable.empty else df_res
         show_cols = ['Turbine', 'Solar_MW', 'BESS_MWh', 'Payback', 'IRR', 'NPV10_M',
-                     'CAPEX_M', 'EBoiler_kW', 'Elec_Offset_MWh', 'Heat_By_EBoiler_MWh',
+                     'CAPEX_M', 'EBoiler_kW', 'Elec_Offset_MWh', 'Green_Elec_Share_pct', 'Heat_By_EBoiler_MWh',
                      'Gas_Used_MWh', 'Curtailed_MWh',
                      'Heat_Sales_k',
                      'Galetech_Carbon_Credit_k',
@@ -1492,6 +1526,7 @@ if run_btn or ('report_cache' in st.session_state):
                 'IRR':                    '{:.1f}%',
                 'Payback':                '{:.1f} yrs',
                 'Elec_Offset_MWh':        '{:.0f}',
+                'Green_Elec_Share_pct':   '{:.1f}%',
                 'Heat_By_EBoiler_MWh':    '{:.0f}',
                 'Gas_Used_MWh':           '{:.0f}',
                 'Curtailed_MWh':          '{:.0f}',
@@ -1580,7 +1615,7 @@ if run_btn or ('report_cache' in st.session_state):
                 rev = out[0]
                 mc_profit    = rev - mc_opex
                 mc_cashflows = [-mc_capex] + [mc_profit] * optimizer.project_life_years
-                mc_irr     = npf.irr(mc_cashflows) if mc_profit > 0 else 0.0
+                mc_irr     = optimizer._safe_irr(mc_capex, mc_profit)
                 mc_npv     = npf.npv(0.10, mc_cashflows)
                 mc_payback = mc_capex / mc_profit if mc_profit > 0 else 99.0
 
