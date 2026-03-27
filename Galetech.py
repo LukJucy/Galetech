@@ -106,7 +106,7 @@ class GaletechAssetOptimizer:
         return float(irr)
 
     # ------------------------------------------------------------------
-    # Daily dispatch optimisation (LP, no integer variables)
+    # Daily dispatch optimisation (MILP with service-priority binary variables)
     #
     # FIX 1: Removed z_grid / z_bess Big-M mutual-exclusion constraints.
     #   The economic price spread (buy price > sell price) naturally
@@ -169,6 +169,7 @@ class GaletechAssetOptimizer:
             p_grid_sell    = cp.Variable(T, nonneg=True)   # export to grid (kW)
             p_grid_buy_proj = cp.Variable(T, nonneg=True)  # project-side grid import for BESS charging (kW)
             p_curtail      = cp.Variable(T, nonneg=True)   # curtailed renewable (kW)
+            z_cust_short   = cp.Variable(T, boolean=True)  # 1 if customer uses grid backup in this hour
 
             # ---- generation profiles (from hourly wind speed & irradiance) ----
             p_wind = np.zeros(T, dtype=float)
@@ -222,6 +223,22 @@ class GaletechAssetOptimizer:
 
                 # (C5) Curtailment cannot exceed available renewable generation
                 p_curtail <= p_wind + p_solar,
+            ]
+
+            # (C5.1) Hard service-priority constraint:
+            # If customer uses grid backup (p_cust_grid > 0), project cannot simultaneously
+            # charge BESS, export to grid, or curtail energy in that same hour.
+            max_surplus_kw = float(
+                grid_buy_limit_kw
+                + export_limit_kw
+                + bess_max_power_kw
+                + np.max(day['elec_load'])
+                + eboiler_max_kw
+                + np.max(p_wind + p_solar)
+            )
+            constraints += [
+                p_cust_grid <= max_surplus_kw * z_cust_short,
+                p_ch + p_grid_sell + p_curtail <= max_surplus_kw * (1 - z_cust_short),
             ]
 
             # (C6) E-boiler power cap
@@ -1128,7 +1145,7 @@ with st.sidebar:
         value=50.0,
     )
     p_galetech_input = st.number_input("Target BOO PPA price — electricity (€/MWh)", value=100.0)
-    p_sell_input     = st.number_input("Grid export price (€/MWh)",                  value=50.0)
+    p_sell_input     = st.number_input("Grid export price (€/MWh)",                  value=100.0)
     cust_grid_penalty_input = st.number_input(
         "Customer grid-backup penalty (€/MWh)",
         min_value=0.0,
