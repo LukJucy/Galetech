@@ -1695,5 +1695,101 @@ Use the spread between P10 and P90 as a quick risk indicator. A wider gap means 
             mime="text/csv",
         )
         if not df_traces.empty:
-            st.subheader("Preview: first 48 hours of dispatch")
-            st.dataframe(df_traces.head(48).style.format({c: '{:.1f}' for c in df_traces.select_dtypes('number').columns}))
+            total_rows = len(df_traces)
+            default_hours = min(48, total_rows)
+            preview_hours = int(
+                st.slider(
+                    "Preview horizon (hours)",
+                    min_value=1,
+                    max_value=total_rows,
+                    value=default_hours,
+                    step=1,
+                )
+            )
+            view_mode = st.radio(
+                "Chart mode",
+                ["Split panels", "Single combined chart"],
+                horizontal=True,
+            )
+
+            preview = df_traces.head(preview_hours).copy()
+            x = np.arange(len(preview))
+
+            st.caption(
+                f"Previewing first {preview_hours} rows out of {total_rows}. "
+                "Rows come from concatenated representative-day traces (typically 24h per day-type), "
+                "not necessarily one continuous real calendar timeline."
+            )
+
+            if view_mode == "Split panels":
+                fig, axes = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
+
+                # Panel 1: customer demand coverage
+                if 'Elec_Demand_kW' in preview:
+                    axes[0].plot(x, preview['Elec_Demand_kW'], label='Customer demand', linewidth=2)
+                if 'BTM_Supply_kW' in preview:
+                    axes[0].plot(x, preview['BTM_Supply_kW'], label='Project supply to customer', linewidth=2)
+                if 'Customer_Grid_Backup_kW' in preview:
+                    axes[0].plot(x, preview['Customer_Grid_Backup_kW'], label='Customer grid backup', linewidth=2)
+                axes[0].set_ylabel('kW')
+                axes[0].set_title('Customer Supply Split')
+                axes[0].grid(alpha=0.25)
+                axes[0].legend(loc='upper right', fontsize=8)
+
+                # Panel 2: renewable and battery operation
+                if 'Wind_Gen_kW' in preview:
+                    axes[1].plot(x, preview['Wind_Gen_kW'], label='Wind generation', linewidth=2)
+                if 'Solar_Gen_kW' in preview:
+                    axes[1].plot(x, preview['Solar_Gen_kW'], label='Solar generation', linewidth=2)
+                if 'BESS_Discharge_kW' in preview:
+                    axes[1].plot(x, preview['BESS_Discharge_kW'], label='BESS discharge', linewidth=2)
+                if 'BESS_Charge_kW' in preview:
+                    axes[1].plot(x, -preview['BESS_Charge_kW'], label='BESS charge (-)', linewidth=2)
+                axes[1].axhline(0, color='black', linewidth=0.8, alpha=0.6)
+                axes[1].set_ylabel('kW')
+                axes[1].set_title('Generation and BESS Operation')
+                axes[1].grid(alpha=0.25)
+                axes[1].legend(loc='upper right', fontsize=8)
+
+                # Panel 3: grid and curtailment flows
+                if 'Grid_Export_kW' in preview:
+                    axes[2].plot(x, preview['Grid_Export_kW'], label='Grid export', linewidth=2)
+                if 'Project_Grid_Import_for_BESS_kW' in preview:
+                    axes[2].plot(x, preview['Project_Grid_Import_for_BESS_kW'], label='Project grid import for BESS', linewidth=2)
+                if 'Curtailed_kW' in preview:
+                    axes[2].plot(x, preview['Curtailed_kW'], label='Curtailment', linewidth=2)
+                axes[2].set_ylabel('kW')
+                axes[2].set_xlabel('Preview row index')
+                axes[2].set_title('Grid Interaction and Curtailment')
+                axes[2].grid(alpha=0.25)
+                axes[2].legend(loc='upper right', fontsize=8)
+
+                st.pyplot(fig)
+                plt.close(fig)
+            else:
+                fig, ax = plt.subplots(figsize=(12, 5))
+                series_to_plot = [
+                    ('Elec_Demand_kW', 'Customer demand'),
+                    ('BTM_Supply_kW', 'Project supply to customer'),
+                    ('Customer_Grid_Backup_kW', 'Customer grid backup'),
+                    ('Wind_Gen_kW', 'Wind generation'),
+                    ('Solar_Gen_kW', 'Solar generation'),
+                    ('BESS_Discharge_kW', 'BESS discharge'),
+                    ('Grid_Export_kW', 'Grid export'),
+                    ('Project_Grid_Import_for_BESS_kW', 'Project grid import for BESS'),
+                    ('Curtailed_kW', 'Curtailment'),
+                ]
+                for col, label in series_to_plot:
+                    if col in preview:
+                        ax.plot(x, preview[col], linewidth=1.8, label=label)
+                if 'BESS_Charge_kW' in preview:
+                    ax.plot(x, -preview['BESS_Charge_kW'], linewidth=1.8, label='BESS charge (-)')
+
+                ax.axhline(0, color='black', linewidth=0.8, alpha=0.6)
+                ax.set_ylabel('kW')
+                ax.set_xlabel('Preview row index')
+                ax.set_title('Hourly Dispatch Preview (Combined)')
+                ax.grid(alpha=0.25)
+                ax.legend(loc='upper right', fontsize=8, ncol=2)
+                st.pyplot(fig)
+                plt.close(fig)
