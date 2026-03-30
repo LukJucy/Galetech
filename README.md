@@ -1,88 +1,94 @@
 # Galetech BOO Optimizer and Bankability Assistant
 
 ## Overview
-Galetech is a techno-economic optimization tool for designing and evaluating on-site energy systems under a Build-Own-Operate (BOO) model. The application co-optimizes wind, solar PV, battery energy storage (BESS), and electric boiler capacity/dispatch to identify commercially viable project configurations.
+Galetech is a Streamlit-based techno-economic optimizer for on-site energy systems under a Build-Own-Operate (BOO) model.
 
-The tool is implemented as an interactive Streamlit application and is designed for project screening, investment decision support, and auditable reporting.
+It co-optimizes:
 
-## Core Objectives
-The model evaluates candidate portfolios against financial and decarbonization outcomes, including:
+- Wind turbine selection and count
+- Solar PV capacity (MW)
+- Battery energy storage (MWh)
+- Electric boiler capacity (kW)
 
-- CAPEX, OPEX, payback, IRR, and NPV
-- Electricity offset and thermal decarbonization
-- Gas displacement and CO2 reduction
-- Dispatch feasibility under site and grid constraints
+The app is designed for project screening, investment decision support, and auditable dispatch reporting.
 
-Users can select optimization priority by:
+## What The Model Optimizes
+Each candidate configuration is evaluated on annualized financial and decarbonization outcomes, including:
+
+- Payback, IRR, NPV
+- CAPEX and OPEX
+- Electricity supplied to customer load
+- Thermal decarbonization (gas displaced by E-boiler heat)
+- CO2 displacement and carbon-credit value
+
+Users can choose optimization objective:
 
 - Shortest Payback
 - Highest IRR
 - Highest NPV
 
 ## Optimization Architecture
-The optimization is executed in two stages:
+The optimization runs in two stages:
 
-1. Coarse capacity sweep to locate promising regions in the design space.
-2. Fine local search around the stage-1 best candidate.
+1. Coarse sweep across wind/solar/BESS/E-boiler design space
+2. Fine search around the best stage-1 region
 
-For each candidate, a daily dispatch LP is solved across representative day profiles with annual weighting.
+For each capacity candidate, a weighted representative-day dispatch MILP is solved with CVXPY + GUROBI.
 
-## Current Commercial and Carbon Logic
-The model reflects the latest commercial logic:
+## Dispatch and Commercial Logic (Current)
+The current implementation reflects a customer-first BOO dispatch logic:
 
-- Gas purchase and direct carbon cost are borne by the customer, not Galetech.
-- Carbon-credit value from avoided emissions is monetized.
-- 50% of carbon-credit value is allocated to Galetech as revenue (`carbon_credit_share = 0.5`).
-- CO2 reduction includes both:
-	- Natural gas displacement (thermal side)
-	- Grid import displacement (electric side)
+- Customer electric demand is split into project supply and customer grid backup.
+- Only project-supplied electricity is billed at BOO PPA price.
+- Customer backup grid purchase is not project revenue.
+- Project-side grid import is modeled separately and only allowed for BESS charging.
+- Hard service-priority constraint: if customer needs grid backup in an hour, the project cannot simultaneously charge BESS, export to grid, or curtail.
+- Gas purchase and direct carbon compliance costs are treated as customer-side economics.
+- Carbon-credit value from avoided emissions is fully allocated to the energy system (`carbon_credit_share = 1.0` in UI defaults).
 
-This structure provides explicit economic incentive for higher decarbonization performance while preserving transparent revenue attribution.
+## Weather and Typical-Day Inputs
+The app supports uploaded hourly CSV/XLSX data (24h blocks), and builds representative day profiles using user-provided day weights.
 
-## Main Features
-- Joint sizing of wind, solar, BESS, and electric boiler.
-- Constraint-aware dispatch optimization (grid limits, SOC dynamics, curtailment, heat balance).
-- **Directional solar irradiance adjustment**: Optional feature to account for panel orientation (SE/SW split, 30° tilt) for more realistic PV generation estimates. Enable via `apply_directional_irradiance=True` in params.
-- Pre-optimization preview charts generated on demand.
-- Persistent report behavior: once a report is generated, it remains visible across UI reruns (for example when generating preview charts) until a new optimization run is triggered.
-- Built-in Monte Carlo sensitivity workflow.
-- Exportable auditable hourly dispatch pack (CSV).
-
-## Inputs
-The app supports uploaded hourly CSV/XLSX data with one row per hour.
-
-Preferred columns:
+Expected columns:
 
 - `elec_load`
 - `gas_load`
 - `wind_speed`
-- `irradiance`
+- `irradiance` (absolute W/m^2)
 
-If any column is missing, the app falls back to default representative profiles for the missing fields.
+If weather-related fields are missing, the app uses weather defaults. If no location is set, Dublin is used by default. If weather fetch fails, synthetic seasonal profiles are used with Dublin as nominal fallback.
 
-## Outputs
-The application produces:
+## Key UI Defaults (Current)
+- Site area: 15 acres
+- Customer electricity price: 130 EUR/MWh
+- BOO PPA electricity price: 100 EUR/MWh
+- Grid export price: 100 EUR/MWh
+- Customer grid-backup penalty: 0 EUR/MWh (optional soft penalty)
 
-- Executive recommendation for best configuration
-- Financial dashboard (payback, IRR, NPV)
-- Customer and developer decarbonization economics
-- Annual cash-flow table (including cumulative profit)
-- Benchmarking and heat maps
-- Monte Carlo risk summary
-- Downloadable hourly dispatch traces
+## Outputs and Report Tabs
+After optimization, the app provides:
+
+- Executive summary with headline recommendation
+- Financial KPI cards (Payback, IRR, NPV)
+- Customer green electricity share KPI
+- Decarbonization and customer-saving metrics
+- Cost breakdown table and annual cash-flow table
+- Technology benchmarking table
+- Monte Carlo risk analysis (P10/P50/P90 + histogram guidance)
+- Downloadable hourly dispatch audit CSV
+
+Note: legacy heat maps were removed from the current report workflow.
 
 ## Project Files
-- `Galetech.py`: main Streamlit app and optimization workflow
-- `GaletechPP.py`, `GaletechIRR.py`: related model variants/experiments
-- `test_gurobi.py`: solver environment test
-- Typical-day CSV files: sample/input profile data
+- `Galetech.py`: main Streamlit app, optimization engine, UI, reporting
+- `typical day data.csv`: sample profile data
 
-## Running the App
-Install dependencies in your Python environment, then run:
+## Run
+Install required dependencies in your Python environment, then run:
 
 ```bash
 streamlit run Galetech.py
 ```
 
 ## Solver Note
-The dispatch LP uses CVXPY with GUROBI in the current implementation. Ensure GUROBI is correctly installed and licensed in your environment.
+The dispatch problem uses CVXPY with the GUROBI solver (mixed-integer model). Ensure GUROBI is installed and licensed in your environment.
