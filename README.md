@@ -82,11 +82,23 @@ Note: legacy heat maps were removed from the current report workflow.
 ## Project Files
 - `Galetech.py`: main Streamlit app, optimization engine, UI, reporting
 - `typical day data.csv`: sample profile data
+- `requirements.txt`: Python dependencies for local development/runtime setup
 
 ## Run
-Install required dependencies in your Python environment, then run:
+Create/activate a Python environment, install dependencies, then run:
 
 ```bash
+pip install -r requirements.txt
+streamlit run Galetech.py
+```
+
+Optional (recommended) virtual environment workflow:
+
+```bash
+python -m venv .venv
+# Windows (PowerShell)
+.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
 streamlit run Galetech.py
 ```
 
