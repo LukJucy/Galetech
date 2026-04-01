@@ -1285,14 +1285,14 @@ with st.sidebar:
 
     st.divider()
     st.header("📐 Site & Physical Constraints")
-    site_area_acre = st.number_input("Site area (acres)", min_value=0.0, max_value=100000.0, value=15.0, step=5.0)
+    site_area_acre = st.number_input("Site area (acres)", min_value=0.0, max_value=100000.0, value=100.0, step=5.0)
     site_max_turbines = int((site_area_acre / 5) * 2)
     site_max_solar = int(site_area_acre / 5)
     col1, col2 = st.columns(2)
     with col1:
         min_turbines = st.number_input("Min turbines",   0, max(0, site_max_turbines), 0)
-        min_bess     = st.number_input("Min BESS (MWh)", 0, 40, 0)
-        max_bess     = st.slider("Max BESS (MWh)",       0, 40, 10, step=1)
+        min_bess     = st.number_input("Min BESS (MWh)", 0, 40, 4)
+        max_bess     = st.slider("Max BESS (MWh)",       0, 40, 12, step=1)
     with col2:
         st.metric("Max turbines (auto)", f"{site_max_turbines}")
         st.metric("Max solar PV (auto, MW)", f"{site_max_solar}")
@@ -1857,12 +1857,26 @@ Use the spread between P10 and P90 as a quick risk indicator. A wider gap means 
 
             preview = df_traces.head(preview_hours).copy()
             x = np.arange(len(preview))
+            # Day-boundary positions (one vertical line every 24 h)
+            day_boundaries = list(range(24, len(preview), 24))
+            has_wind_asset = int(best.get('t_count_raw', 0)) > 0
+            has_solar_asset = float(best.get('Solar_MW', 0.0)) > 0
+            has_bess_asset = float(best.get('BESS_MWh', 0.0)) > 0
 
             st.caption(
                 f"Previewing first {preview_hours} rows out of {total_rows}. "
                 "Rows come from concatenated representative-day traces (typically 24h per day-type), "
                 "not necessarily one continuous real calendar timeline."
             )
+            hidden_series = []
+            if not has_wind_asset:
+                hidden_series.append("wind generation")
+            if not has_solar_asset:
+                hidden_series.append("solar generation")
+            if not has_bess_asset:
+                hidden_series.append("BESS charge/discharge and BESS grid-import flow")
+            if hidden_series:
+                st.info("Hidden in charts (not installed in optimal config): " + ", ".join(hidden_series) + ".")
 
             if view_mode == "Split panels":
                 fig, axes = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
@@ -1880,13 +1894,13 @@ Use the spread between P10 and P90 as a quick risk indicator. A wider gap means 
                 axes[0].legend(loc='upper right', fontsize=8)
 
                 # Panel 2: renewable and battery operation
-                if 'Wind_Gen_kW' in preview:
+                if 'Wind_Gen_kW' in preview and has_wind_asset:
                     axes[1].plot(x, preview['Wind_Gen_kW'], label='Wind generation', linewidth=2)
-                if 'Solar_Gen_kW' in preview:
+                if 'Solar_Gen_kW' in preview and has_solar_asset:
                     axes[1].plot(x, preview['Solar_Gen_kW'], label='Solar generation', linewidth=2)
-                if 'BESS_Discharge_kW' in preview:
+                if 'BESS_Discharge_kW' in preview and has_bess_asset:
                     axes[1].plot(x, preview['BESS_Discharge_kW'], label='BESS discharge', linewidth=2)
-                if 'BESS_Charge_kW' in preview:
+                if 'BESS_Charge_kW' in preview and has_bess_asset:
                     axes[1].plot(x, -preview['BESS_Charge_kW'], label='BESS charge (-)', linewidth=2)
                 axes[1].axhline(0, color='black', linewidth=0.8, alpha=0.6)
                 axes[1].set_ylabel('kW')
@@ -1897,12 +1911,15 @@ Use the spread between P10 and P90 as a quick risk indicator. A wider gap means 
                 # Panel 3: grid and curtailment flows
                 if 'Grid_Export_kW' in preview:
                     axes[2].plot(x, preview['Grid_Export_kW'], label='Grid export', linewidth=2)
-                if 'Project_Grid_Import_for_BESS_kW' in preview:
+                if 'Project_Grid_Import_for_BESS_kW' in preview and has_bess_asset:
                     axes[2].plot(x, preview['Project_Grid_Import_for_BESS_kW'], label='Project grid import for BESS', linewidth=2)
                 if 'Curtailed_kW' in preview:
                     axes[2].plot(x, preview['Curtailed_kW'], label='Curtailment', linewidth=2)
                 axes[2].set_ylabel('kW')
-                axes[2].set_xlabel('Preview row index')
+                for ax_i in axes:
+                    for db in day_boundaries:
+                        ax_i.axvline(db, color='gray', linewidth=0.7, linestyle='--', alpha=0.5)
+                axes[2].set_xlabel('Hour  (each step = 1 h; dashed lines = day boundaries)')
                 axes[2].set_title('Grid Interaction and Curtailment')
                 axes[2].grid(alpha=0.25)
                 axes[2].legend(loc='upper right', fontsize=8)
@@ -1923,16 +1940,47 @@ Use the spread between P10 and P90 as a quick risk indicator. A wider gap means 
                     ('Curtailed_kW', 'Curtailment'),
                 ]
                 for col, label in series_to_plot:
+                    if col == 'Wind_Gen_kW' and not has_wind_asset:
+                        continue
+                    if col == 'Solar_Gen_kW' and not has_solar_asset:
+                        continue
+                    if col in ['BESS_Discharge_kW', 'Project_Grid_Import_for_BESS_kW'] and not has_bess_asset:
+                        continue
                     if col in preview:
                         ax.plot(x, preview[col], linewidth=1.8, label=label)
-                if 'BESS_Charge_kW' in preview:
+                if 'BESS_Charge_kW' in preview and has_bess_asset:
                     ax.plot(x, -preview['BESS_Charge_kW'], linewidth=1.8, label='BESS charge (-)')
 
                 ax.axhline(0, color='black', linewidth=0.8, alpha=0.6)
                 ax.set_ylabel('kW')
-                ax.set_xlabel('Preview row index')
+                for db in day_boundaries:
+                    ax.axvline(db, color='gray', linewidth=0.7, linestyle='--', alpha=0.5)
+                ax.set_xlabel('Hour  (each step = 1 h; dashed lines = day boundaries)')
                 ax.set_title('Hourly Dispatch Preview (Combined)')
                 ax.grid(alpha=0.25)
                 ax.legend(loc='upper right', fontsize=8, ncol=2)
                 st.pyplot(fig)
                 plt.close(fig)
+
+            # --- BESS SOC profile ---
+            if 'BESS_SoC_kWh' in preview.columns and best['BESS_MWh'] > 0:
+                cap_kwh = best['BESS_MWh'] * 1000
+                st.subheader("Battery State of Charge (SoC)")
+                fig_soc, ax_soc = plt.subplots(figsize=(12, 3))
+                ax_soc.plot(x, preview['BESS_SoC_kWh'], color='steelblue', linewidth=2, label='SoC (kWh)')
+                ax_soc.fill_between(x, preview['BESS_SoC_kWh'], alpha=0.15, color='steelblue')
+                ax_soc.axhline(cap_kwh * 0.9, color='red',   linewidth=1, linestyle='--', label='90% limit')
+                ax_soc.axhline(cap_kwh * 0.5, color='grey',  linewidth=1, linestyle=':',  label='50% (initial)')
+                ax_soc.axhline(cap_kwh * 0.1, color='orange',linewidth=1, linestyle='--', label='10% limit')
+                ax_soc.set_ylim(0, cap_kwh * 1.05)
+                ax_soc.set_ylabel('SoC (kWh)')
+                for db in day_boundaries:
+                    ax_soc.axvline(db, color='gray', linewidth=0.7, linestyle='--', alpha=0.5)
+                ax_soc.set_xlabel('Hour  (each step = 1 h; dashed lines = day boundaries)')
+                ax_soc.set_title(f'BESS State of Charge — capacity {best["BESS_MWh"]} MWh ({cap_kwh:.0f} kWh)')
+                ax_soc.grid(alpha=0.25)
+                ax_soc.legend(loc='upper right', fontsize=8)
+                st.pyplot(fig_soc)
+                plt.close(fig_soc)
+            else:
+                st.info("SOC chart is only available when the selected optimal configuration includes BESS (BESS_MWh > 0).")
