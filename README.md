@@ -35,6 +35,61 @@ The optimization runs in two stages:
 
 For each capacity candidate, a weighted representative-day dispatch MILP is solved with CVXPY + GUROBI.
 
+## Model Structure
+The model is a coupled planning + dispatch framework:
+
+- Planning layer (capacity decision):
+  - Wind turbine type and count
+  - Solar PV capacity
+  - BESS energy capacity
+  - E-boiler rated power
+- Dispatch layer (hourly operation on representative days):
+  - Power split between customer supply, battery charge/discharge, grid import/export, and curtailment
+  - Heat split between E-boiler and remaining gas use
+
+Main hourly decision variables include:
+
+- `p_site_supply`: project electricity served to customer load
+- `p_cust_grid`: customer direct grid backup
+- `p_ch`, `p_dis`, `soc`: BESS charge, discharge, and state of charge
+- `p_grid_buy_proj`, `p_grid_sell`: project-side grid import/export
+- `p_eboiler_elec`, `p_gas_used`: heat-side electric and gas contributions
+- `p_curtail`: curtailed renewable power
+- `z_cust_short` (binary): indicates customer shortfall hour for hard priority logic
+
+Core constraints:
+
+- Electricity balance (project side)
+- Customer demand split: project supply + customer backup = load
+- Heat balance: E-boiler heat + gas heat = thermal demand
+- Grid import/export limits and shared import headroom
+- BESS SOC dynamics, power limits, and cyclic terminal SOC
+- E-boiler max power limit
+- Hard service-priority constraint (customer shortfall blocks simultaneous charge/export/curtail)
+
+Land/capacity feasibility is enforced outside dispatch through acreage-based limits and combined site rules.
+
+## Optimization Method
+The method combines design-space search with exact operational optimization:
+
+1. Stage-1 coarse search
+	- Enumerate feasible capacity combinations on a coarse grid.
+	- For each candidate, solve representative-day dispatch MILP and annualize by day weights.
+2. Stage-2 fine search
+	- Build a local neighborhood around the best stage-1 solution.
+	- Re-solve dispatch MILP for refined candidates.
+3. Financial post-processing
+	- Compute CAPEX, OPEX, annual profit, payback, IRR, NPV.
+	- Filter viability by selected optimization metric:
+	  - Payback mode: positive payback within project life
+	  - IRR mode: IRR > 0
+	  - NPV mode: NPV > 0
+4. Final recommendation
+	- Return top feasible design under selected objective.
+	- Export auditable hourly traces for the chosen configuration.
+
+Objective (dispatch level): maximize annualized project value from electricity sales, heat sales, grid export, and carbon-credit value, minus project-side energy purchases and operating penalties/costs.
+
 ## Dispatch and Commercial Logic (Current)
 The current implementation reflects a customer-first BOO dispatch logic:
 
