@@ -170,6 +170,7 @@ class GaletechAssetOptimizer:
             p_grid_buy_proj = cp.Variable(T, nonneg=True)  # project-side grid import for BESS charging (kW)
             p_curtail      = cp.Variable(T, nonneg=True)   # curtailed renewable (kW)
             z_cust_short   = cp.Variable(T, boolean=True)  # 1 if customer uses grid backup in this hour
+            z_bess_charge  = cp.Variable(T, boolean=True)  # 1 if BESS is charging, 0 if discharging
 
             # ---- generation profiles (from hourly wind speed & irradiance) ----
             p_wind = np.zeros(T, dtype=float)
@@ -212,6 +213,7 @@ class GaletechAssetOptimizer:
                 p_site_supply + p_cust_grid == day['elec_load'],
 
                 # (C3) Heat balance: e-boiler heat + gas = total gas-heat demand
+                # Note: day['gas_load'] is in kWh per hour (hourly thermal energy), treated as kWth (power) in hourly dispatch model
                 eboiler_eff * p_eboiler_elec + p_gas_used == day['gas_load'],
 
                 # (C4) Grid limits (no Big-M; price spread prevents simultaneous buy+sell)
@@ -228,17 +230,19 @@ class GaletechAssetOptimizer:
             # (C5.1) Hard service-priority constraint:
             # If customer uses grid backup (p_cust_grid > 0), project cannot simultaneously
             # charge BESS, export to grid, or curtail energy in that same hour.
-            max_surplus_kw = float(
+            # Use hour-specific Big-M (M_t) instead of one global constant.
+            # Tighter bounds usually improve MILP numerics and solve speed.
+            max_surplus_kw = (
                 grid_buy_limit_kw
                 + export_limit_kw
                 + bess_max_power_kw
-                + np.max(day['elec_load'])
-                + eboiler_max_kw
-                + np.max(p_wind + p_solar)
+                + np.asarray(day['elec_load'], dtype=float)
+                + float(eboiler_max_kw)
+                + (p_wind + p_solar)
             )
             constraints += [
-                p_cust_grid <= max_surplus_kw * z_cust_short,
-                p_ch + p_grid_sell + p_curtail <= max_surplus_kw * (1 - z_cust_short),
+                p_cust_grid <= cp.multiply(max_surplus_kw, z_cust_short),
+                p_ch + p_grid_sell + p_curtail <= cp.multiply(max_surplus_kw, 1 - z_cust_short),
             ]
 
             # (C6) E-boiler power cap
@@ -264,15 +268,20 @@ class GaletechAssetOptimizer:
                     # Power limits
                     p_ch  <= bess_max_power_kw,
                     p_dis <= bess_max_power_kw,
-                    # Project grid import is only allowed for battery charging.
-                    p_grid_buy_proj <= p_ch,
+                    # BESS can only charge from renewable surplus, not from grid purchase.
+                    # Disable grid import for battery charging to avoid arbitrage.
+                    p_grid_buy_proj == 0,
+                    # (C7.1) Prevent simultaneous charge and discharge:
+                    # If z_bess_charge[t]=1, then discharge p_dis[t]=0; if z_bess_charge[t]=0, then charge p_ch[t]=0
+                    p_ch  <= bess_max_power_kw * z_bess_charge,
+                    p_dis <= bess_max_power_kw * (1 - z_bess_charge),
                 ]
                 for t in range(1, T):
                     constraints.append(
                         soc[t] == soc[t - 1] + p_ch[t] * self.bess_eff - p_dis[t] / self.bess_eff
                     )
             else:
-                constraints += [p_ch == 0, p_dis == 0, soc == 0, p_grid_buy_proj == 0]
+                constraints += [p_ch == 0, p_dis == 0, soc == 0, p_grid_buy_proj == 0, z_bess_charge == 0]
 
             # ---- objective ----
             # Galetech revenue streams
@@ -346,14 +355,14 @@ class GaletechAssetOptimizer:
                                 "Day_Type":        f"Scenario_{day_idx + 1}",
                                 "Hour":            t,
                                 "Elec_Demand_kW":  day['elec_load'][t],
-                                "Gas_Demand_kW":   day['gas_load'][t],
+                                "Gas_Demand_kWh":  day['gas_load'][t],  # kWh/hour thermal energy = kWth power
                                 "Wind_Gen_kW":     p_wind[t],
                                 "Solar_Gen_kW":    p_solar[t],
                                 "BESS_SoC_kWh":    soc.value[t] if b_mwh > 0 else 0,
                                 "BESS_Charge_kW":  p_ch.value[t] if b_mwh > 0 else 0,
                                 "BESS_Discharge_kW": p_dis.value[t] if b_mwh > 0 else 0,
                                 "EBoiler_Elec_kW": p_eboiler_elec.value[t],
-                                "Gas_Used_kWth":   p_gas_used.value[t],
+                                "Gas_Used_kWh":    p_gas_used.value[t],  # thermal energy kWh/hour
                                 "BTM_Supply_kW":   p_site_supply.value[t],
                                 "Customer_Grid_Backup_kW": p_cust_grid.value[t],
                                 "Grid_Export_kW":  p_grid_sell.value[t],
@@ -363,6 +372,7 @@ class GaletechAssetOptimizer:
                             })
                 else:
                     # Detailed diagnostics for infeasible/unbounded problems
+                    # Use deduplication to avoid spamming same error type multiple times
                     max_elec_demand = np.max(day['elec_load'])
                     max_gas_demand = np.max(day['gas_load'])
                     max_avail_wind = np.sum(p_wind)
@@ -370,28 +380,56 @@ class GaletechAssetOptimizer:
                     max_avail_renewable = max_avail_wind + max_avail_solar
                     
                     if prob.status == "infeasible":
-                        # Hypothesis: Can we meet demand with grid + renewables?
-                        avg_demand = (np.sum(day['elec_load']) + np.sum(day['gas_load']) * eboiler_eff / 1000) / T
-                        st.warning(
-                            f"❌ Day {day_idx + 1}: **INFEASIBLE** solution detected.\n\n"
-                            f"**Diagnosis:**\n"
-                            f"- Avg elec demand: {avg_demand:.1f} kW\n"
-                            f"- Max gas demand: {max_gas_demand:.0f} kWth (→ {max_gas_demand * eboiler_eff / 1000:.1f} kW electric equiv.)\n"
-                            f"- Available renewable (wind+solar): {max_avail_renewable:.0f} kW\n"
-                            f"- Customer grid backup limit: {grid_buy_limit_kw:.0f} kW\n\n"
-                            f"**Likely causes:**\n"
-                            f"1) 🔋 Battery size too small: Increase BESS capacity\n"
-                            f"2) 💨 Insufficient renewable: Increase turbines or solar MW\n"
-                            f"3) 🔌 Customer grid backup limit too tight: Check 'grid_buy_limit_kw' parameter\n"
-                            f"4) 🔥 Heating demand too high: Reduce 'eboiler_eff' or add gas boiler capacity\n"
-                            f"5) ⚡ E-boiler max power too low: Increase 'eboiler_max_kw'\n\n"
-                            f"Config: {t_model} ×{t_count}, Solar={s_mw} MW, BESS={b_mwh} MWh"
-                        )
+                        # Only show detailed diagnosis for the first infeasible day encountered
+                        diag_key = f"infeasible_day_{day_idx}"
+                        if diag_key not in self._warned_solver_exceptions:
+                            avg_demand = (np.sum(day['elec_load']) + np.sum(day['gas_load']) * eboiler_eff / 1000) / T
+                            
+                            # Additional analysis: check if max hourly load exceeds grid limit + renewable
+                            grid_backup_capacity = grid_buy_limit_kw
+                            max_hourly_supply = max_avail_renewable + grid_backup_capacity + (bess_max_power_kw if b_mwh > 0 else 0)
+                            shortfall = max(0, max_elec_demand - max_hourly_supply)
+                            
+                            # Specific diagnostic for "no storage + high demand" scenario
+                            diagnosis = (
+                                f"**Diagnostic Analysis (Peak Hour):**\n"
+                                f"- Max hourly elec demand: {max_elec_demand:.0f} kW\n"
+                                f"- Available renewable: {max_avail_renewable:.0f} kW\n"
+                                f"- Grid backup (p_cust_grid) limit: {grid_backup_capacity:.0f} kW\n"
+                                f"- BESS discharge capacity: {bess_max_power_kw:.0f} kW\n"
+                                f"- **Total supply capacity: {max_hourly_supply:.0f} kW**\n"
+                            )
+                            if shortfall > 0:
+                                diagnosis += f"- **⚠️  SHORTFALL: {shortfall:.0f} kW** (demand exceeds all available supply sources)\n\n"
+                                diagnosis += "**Primary issue**: Peak demand exceeds all available supply (renewable + grid + storage).\n"
+                            else:
+                                diagnosis += "\n"
+                            
+                            st.warning(
+                                f"❌ Day {day_idx + 1}: **INFEASIBLE** solution detected.\n\n"
+                                f"**Demand Profile:**\n"
+                                f"- Avg load: {avg_demand:.1f} kW\n"
+                                f"- Max load: {max_elec_demand:.0f} kW\n"
+                                f"- Max heat demand: {max_gas_demand:.0f} kWth → {max_gas_demand * eboiler_eff / 1000:.0f} kW equiv.\n\n"
+                                f"{diagnosis}"
+                                f"**Recommended fixes:**\n"
+                                f"1) 📈 **Increase renewable capacity**: More solar/wind MW\n"
+                                f"2) 🔋 **Add battery storage**: BESS shifts demand across hours\n"
+                                f"3) 📡 **Increase grid import limit**: Raise 'grid_buy_limit_kw' if available grid capacity supports it\n"
+                                f"4) 💨 **Add wind turbines**: Generates when solar doesn't (nights, cloudy)\n"
+                                f"5) 🌡️ **Reduce heating demand**: Use gas boiler backup instead of E-boiler\n\n"
+                                f"Config: {t_model} ×{t_count}, Solar={s_mw} MW, BESS={b_mwh} MWh"
+                            )
+                            self._warned_solver_exceptions.add(diag_key)
                     else:
-                        st.warning(
-                            f"Day {day_idx + 1}: LP status = {prob.status}. "
-                            f"Config: {t_model} ×{t_count}, Solar={s_mw} MW, BESS={b_mwh} MWh"
-                        )
+                        # For other statuses (unbounded, etc.), show compact message only once per status type
+                        status_key = f"solver_status_{prob.status}"
+                        if status_key not in self._warned_solver_exceptions:
+                            st.warning(
+                                f"⚠️  Day {day_idx + 1}: LP status = {prob.status}. "
+                                f"Config: {t_model} ×{t_count}, Solar={s_mw} MW, BESS={b_mwh} MWh"
+                            )
+                            self._warned_solver_exceptions.add(status_key)
             except Exception as e:
                 # Avoid spamming repeated identical exception lines across many candidate configs.
                 err_key = str(e)
@@ -450,6 +488,9 @@ class GaletechAssetOptimizer:
             e_steps = [0]
 
         stage1_results = []
+        stage1_skipped_feasibility = 0  # Configs skipped by feasibility pre-check
+        stage1_failed_infeasible = 0     # Configs that failed LP solve (infeasible)
+        
         for t_model in turbine_choices:
             counts = [0] if t_model == 'None' else list(t_count_steps)
             for t_count in counts:
@@ -460,11 +501,50 @@ class GaletechAssetOptimizer:
                         for e_kw in e_steps:
                             if b < min_bess:
                                 continue
-                            if t_count == 0 and s == 0 and b == 0:
-                                continue
+                            if t_count == 0 and s == 0:
+                                continue  # 禁止无风无光配置（有无电池皆禁）
                             # New land rule: every 5 acres allows up to 2 turbines and 1 MW PV.
                             # Combined form: t_count/2 + s <= site_area_acre/5.
                             if (t_count / 2.0 + s) > (site_area_acre / 5.0):
+                                continue
+
+                            # ---- Quick feasibility pre-check ----
+                            # Before running expensive LP solve, verify that max available supply >= max demand
+                            # This avoids solving infeasible problems that configuration can never meet.
+                            max_feasible_supply = 0.0
+                            max_demand = 0.0
+                            
+                            for day in rep_days:
+                                # Max wind generation in this day
+                                p_wind_max = self.get_wind_power(day['wind_speed'], t_model, t_count).max() if t_model != "None" else 0.0
+                                # Max solar generation in this day
+                                if s > 0:
+                                    irr_wm2 = np.clip(day['irradiance'], 0.0, 1400.0)
+                                    eta = max(self.params['solar_efficiency'], 1e-6)
+                                    pv_land_area_m2 = s * 5.0 * self.acre_to_m2
+                                    p_solar_area_kw = irr_wm2 * pv_land_area_m2 * eta * min(1.0, 1000.0 / (eta * 5.0 * self.acre_to_m2)) / 1000.0
+                                    p_solar_max = min(p_solar_area_kw.max(), s * 1000.0)
+                                else:
+                                    p_solar_max = 0.0
+                                
+                                # Max supply in this day: renewable + grid limit + battery discharge limit
+                                grid_limit = self.params.get('grid_buy_limit_kw', 5000)
+                                bess_discharge_max = (b * 1000 * 0.5) if b > 0 else 0.0  # assumes 2h discharge time
+                                max_supply_day = p_wind_max + p_solar_max + grid_limit + bess_discharge_max
+                                
+                                # Max demand in this day (elec + heat converted to elec)
+                                eboiler_eff = self.params.get('eboiler_efficiency', 1.0)
+                                max_elec_demand = np.max(day['elec_load'])
+                                max_heat_demand_as_elec = np.max(day['gas_load']) * eboiler_eff / 1000.0  # kWth to kW equiv
+                                max_demand_day = max_elec_demand + max_heat_demand_as_elec
+                                
+                                max_feasible_supply = max(max_feasible_supply, max_supply_day)
+                                max_demand = max(max_demand, max_demand_day)
+                            
+                            # If peak demand exceeds peak supply capacity by >5% margin, skip this config
+                            # (small margin to account for rounding and model approximations)
+                            if max_demand > max_feasible_supply * 1.05:
+                                stage1_skipped_feasibility += 1
                                 continue
 
                             capex, _, _, _, _ = self.get_capex(t_model, t_count, s, b, eboiler_kw=e_kw)
@@ -473,8 +553,10 @@ class GaletechAssetOptimizer:
 
                             # Robust handling of return value
                             if out is None or isinstance(out, pd.DataFrame):
+                                stage1_failed_infeasible += 1
                                 continue
                             if not isinstance(out, tuple) or len(out) != 7:
+                                stage1_failed_infeasible += 1
                                 continue
 
                             revenue, co2, btm_e, heat_elec, gas_used, curt, curt_cost = out
@@ -517,7 +599,13 @@ class GaletechAssetOptimizer:
 
         df_stage1 = pd.DataFrame(stage1_results)
         if df_stage1.empty:
-            return pd.DataFrame(), None
+            # Return diagnostic info in the DataFrame so UI can explain why
+            diag_df = pd.DataFrame([{
+                'error_type': 'stage1_empty',
+                'skipped_feasibility': stage1_skipped_feasibility,
+                'failed_infeasible': stage1_failed_infeasible,
+            }])
+            return diag_df, None
 
         if optimization_metric == 'IRR':
             best_stage1 = df_stage1.sort_values('IRR', ascending=False).iloc[0]
@@ -549,8 +637,8 @@ class GaletechAssetOptimizer:
                         }:
                             if b < min_bess:
                                 continue
-                            if t_count == 0 and s == 0 and b == 0:
-                                continue
+                            if t_count == 0 and s == 0:
+                                continue  # 禁止无风无光配置（有无电池皆禁）
                             if (t_count / 2.0 + s) > (site_area_acre / 5.0):
                                 continue
                             candidates.add((t_model, t_count, s, b, e_kw))
@@ -875,10 +963,12 @@ def load_custom_typical_days(df=None, custom_weights=None, show_warnings=True, w
                 elec_load = 1200 + 400 * np.sin((t - 8) * np.pi / 12)
 
             if 'gas_load' in df.columns:
+                # gas_load is expected in kWh (thermal energy per hour)
+                # In hourly dispatch model, this is treated as kWth (thermal power)
                 gas_load = day_data['gas_load'].values.astype(float)
             else:
                 if show_warnings:
-                    st.warning("Column 'gas_load' not found — using zero thermal load.")
+                    st.warning("Column 'gas_load' not found — using zero thermal load (kWh/hour).")
                 gas_load = np.zeros(24, dtype=float)
 
             if 'wind_speed' in df.columns:
@@ -946,8 +1036,9 @@ def render_pre_run_preview(rep_days, solar_efficiency, weather_profiles=None):
     """Render pre-optimisation typical-day load and generation preview charts.
 
     Figure 1 (demand): always uses rep_days directly — actual uploaded data if available,
-    otherwise the 3 synthetic seasonal profiles from load_custom_typical_days.
+    otherwise the 3 seasonal profiles from load_custom_typical_days.
     Figures 2 & 3 (weather / generation): always show exactly 3 seasonal lines from weather_profiles.
+    Weather data MUST come from fetched Open-Meteo data, not synthetic fallback.
     """
     if not rep_days:
         return
@@ -956,12 +1047,17 @@ def render_pre_run_preview(rep_days, solar_efficiency, weather_profiles=None):
     hours = np.arange(24)
 
     # --- Build 3 seasonal weather profiles for Figures 2 & 3 ---
+    # ONLY use fetched weather data, NO synthetic fallback
     if isinstance(weather_profiles, list):
         profiles = weather_profiles
     elif isinstance(weather_profiles, dict) and 'profiles' in weather_profiles:
         profiles = weather_profiles['profiles']
     else:
-        profiles = get_synthetic_weather_profiles()
+        st.error(
+            "❌ Preview charts require fetched weather data from Open-Meteo. "
+            "Weather profiles not available. Please ensure weather data has been successfully fetched."
+        )
+        return
 
     season_days = [
         {
@@ -974,9 +1070,9 @@ def render_pre_run_preview(rep_days, solar_efficiency, weather_profiles=None):
 
     st.subheader("Pre-Optimisation Typical Day Preview")
     st.caption(
-        "Demand chart shows uploaded representative day profiles (or synthetic seasonal profiles if no file is uploaded). "
+        "Demand chart shows uploaded representative day profiles (or default seasonal profiles if no file is uploaded). "
         "Weather and generation charts show 3 seasonal profiles (Summer / Winter / Spring-Autumn) "
-        "built from the previous full year's hourly data by seasonal hour-of-day averaging. "
+        "built from the previous full year's hourly Open-Meteo data by seasonal hour-of-day averaging. "
         "Reference generation: 1 x EWT 1MW turbine + 1 MW solar PV."
     )
 
@@ -986,9 +1082,9 @@ def render_pre_run_preview(rep_days, solar_efficiency, weather_profiles=None):
         day_label = day.get('label', f'Day {i}')
         ax_load.plot(hours, day['elec_load'], linewidth=2, label=f"{day_label} Electricity Demand")
         ax_load.plot(hours, day['gas_load'], linestyle='--', linewidth=1.8, label=f"{day_label} Heat Demand")
-    ax_load.set_title("Representative Day — Electricity & Heat Demand (kW)")
-    ax_load.set_xlabel("Hour")
-    ax_load.set_ylabel("Power (kW)")
+    ax_load.set_title("Representative Day — Electricity & Heat Demand Profiles")
+    ax_load.set_xlabel("Hour of Day")
+    ax_load.set_ylabel("Power (kW) / Energy (kWh per hour)")
     ax_load.set_xticks(np.arange(0, 24, 2))
     ax_load.grid(alpha=0.25)
     ax_load.legend(ncol=2, fontsize=8)
@@ -1047,9 +1143,13 @@ with st.sidebar:
     st.header("📂 Data & Profile Setup")
     st.info(
         "Upload hourly CSV/Excel with columns `elec_load`, `wind_speed`, `irradiance` "
-        "(optional: `gas_load`), one row per hour. "
-        "Renewable output is now calculated from wind speed and irradiance. "
-        "`irradiance` should be absolute value in W/m^2."
+        "(optional: `gas_load`), one row per hour.\n\n"
+        "**Units:**\n"
+        "- `elec_load`: kW (power)\n"
+        "- `gas_load`: kWh (thermal energy per hour, treated as kWth power in hourly model)\n"
+        "- `wind_speed`: m/s\n"
+        "- `irradiance`: W/m² (absolute value)\n\n"
+        "Renewable output is calculated from wind speed and irradiance."
     )
     uploaded_file = st.file_uploader(
         "Customer Hourly Load Profile",
@@ -1087,26 +1187,22 @@ with st.sidebar:
     # Auto-default weather when user has not fetched any location yet.
     if 'weather_defaults' not in st.session_state:
         default_location = (st.session_state.get('weather_location_query', 'Dublin') or 'Dublin').strip() or 'Dublin'
+        st.info(f"⏳ Fetching weather data from Open-Meteo for {default_location}...")
         try:
             weather_payload = fetch_last_year_typical_weather(default_location)
             st.session_state['weather_defaults'] = weather_payload
             st.session_state['weather_location_query'] = default_location
-            st.info(
-                f"No weather location selected/fetched. Using default location: {weather_payload['location_label']} "
-                f"({weather_payload['year']} historical data)."
+            st.success(
+                f"✓ Weather defaults loaded for {weather_payload['location_label']} "
+                f"using {weather_payload['year']} historical data (Open-Meteo)."
             )
-        except Exception:
-            st.session_state['weather_defaults'] = {
-                'location_label': 'Dublin (synthetic fallback)',
-                'source': 'Synthetic seasonal weather profiles',
-                'year': 'N/A',
-                'profiles': get_synthetic_weather_profiles(),
-            }
-            st.session_state['weather_location_query'] = 'Dublin'
-            st.warning(
-                "No weather location selected and live weather fetch is unavailable. "
-                "Using synthetic seasonal profiles with Dublin as the default nominal location."
+        except Exception as exc:
+            st.error(
+                f"❌ Unable to fetch weather data from Open-Meteo for '{default_location}': {exc}\n\n"
+                f"Please enter a valid city name and click '🌤️ Fetch Last-Year Weather Defaults' to proceed. "
+                f"The app requires real historical weather data to ensure accurate modeling."
             )
+            st.stop()
 
     if 'weather_defaults' in st.session_state:
         weather_info = st.session_state['weather_defaults']
@@ -1189,7 +1285,7 @@ with st.sidebar:
 
     st.divider()
     st.header("📐 Site & Physical Constraints")
-    site_area_acre = st.number_input("Site area (acres)", min_value=0.0, max_value=5000.0, value=15.0, step=5.0)
+    site_area_acre = st.number_input("Site area (acres)", min_value=0.0, max_value=100000.0, value=15.0, step=5.0)
     site_max_turbines = int((site_area_acre / 5) * 2)
     site_max_solar = int(site_area_acre / 5)
     col1, col2 = st.columns(2)
@@ -1315,8 +1411,38 @@ if run_btn or ('report_cache' in st.session_state):
             )
 
         if df_res.empty or best is None:
-            st.error("No commercially viable configurations found. "
-                     "Try relaxing constraints or adjusting prices.")
+            # Check if we have diagnostic info
+            error_msg = (
+                "❌ **No commercially viable configurations found.**\n\n"
+                "**This happens when:**\n"
+                "1. **All configurations are technically infeasible** — Even with grid backup, cannot meet demand peaks\n"
+                "   → Add battery storage (BESS) or more renewable capacity (wind/solar)\n"
+                "2. **All configurations have negative economics** — Costs exceed revenues at current prices\n"
+                "   → Increase PPA electricity price, reduce CAPEX assumptions, or reduce demand\n"
+                "3. **constraints are too tight** — Site area, grid link capacity, or other limits prevent viable designs\n\n"
+            )
+            
+            # Add diagnostic details if available
+            if not df_res.empty and 'error_type' in df_res.columns:
+                skipped = df_res.iloc[0].get('skipped_feasibility', 0)
+                failed = df_res.iloc[0].get('failed_infeasible', 0)
+                if skipped > 0 or failed > 0:
+                    error_msg += f"**Diagnostic breakdown (Stage 1):**\n"
+                    if skipped > 0:
+                        error_msg += f"- {skipped} configs rejected by feasibility pre-check (peak demand > peak supply)\n"
+                    if failed > 0:
+                        error_msg += f"- {failed} configs failed dispatch optimization (LP infeasible)\n\n"
+            
+            error_msg += (
+                "**Recommended actions:**\n"
+                "- 📈 Increase customer electricity price (PPA rate)\n"
+                "- 📊 Check your load profile — very high peaks may require large storage\n"
+                "- 🔌 Verify grid_buy_limit_kw is sufficient for backup power\n"
+                "- 💰 Reduce cost assumptions (CAPEX, OPEX, interest rate)\n"
+                "- 🌍 Check that renewable resource (wind/solar) is adequate for location"
+            )
+            
+            st.error(error_msg)
             st.stop()
 
         # ---- Filter viability by selected optimisation metric ----
