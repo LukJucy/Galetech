@@ -129,10 +129,34 @@ After optimization, the app provides:
 - Decarbonization and customer-saving metrics
 - Cost breakdown table and annual cash-flow table
 - Technology benchmarking table
-- Monte Carlo risk analysis (P10/P50/P90 + histogram guidance)
+- Monte Carlo risk analysis (P10/P50/P90 + histogram guidance) — see below for perturbed parameters
 - Downloadable hourly dispatch audit CSV
 
 Note: legacy heat maps were removed from the current report workflow.
+
+## Monte Carlo Uncertainty Analysis
+
+The Monte Carlo tab runs 50 independent simulations on the optimal configuration, each with independently sampled perturbations to three uncertain parameters:
+
+| Parameter | Distribution | Std Dev | What it captures |
+|---|---|---|---|
+| **Wind resource** (`wind_shock`) | Normal(1.0, 0.10) | ±10% | Inter-annual wind speed variability, turbine degradation, wake losses |
+| **CAPEX** (`capex_shock`) | Normal(1.0, 0.05) | ±5% | Construction cost overrun, equipment price fluctuation |
+| **PPA electricity price** (`ppa_shock`) | Normal(1.0, 0.05) | ±5% | Revenue uncertainty from contract renegotiation or market price changes |
+
+For each sampled scenario, the dispatch MILP is re-solved and the following financial KPIs are computed:
+
+- **Payback period** (years)
+- **IRR** (%)
+- **NPV** (M€)
+
+Results are reported as **P10 / P50 / P90 percentiles**:
+
+- **P10 (Optimistic)**: 10% of scenarios achieve this outcome or better.
+- **P50 (Median)**: Central expected outcome.
+- **P90 (Conservative)**: 90% of scenarios achieve this or better; used for downside planning.
+
+The spread between P10 and P90 serves as a quick risk indicator — a wider gap indicates higher project uncertainty.
 
 ## Project Files
 - `Galetech.py`: main Streamlit app, optimization engine, UI, reporting

@@ -1723,14 +1723,31 @@ if run_btn or ('report_cache' in st.session_state):
     # ---------- Tab 4: Monte Carlo ----------
     with tab4:
         st.header("Monte Carlo Uncertainty Analysis")
+        st.markdown(
+            """
+**Perturbed parameters in each simulation run:**
+
+| Parameter | Distribution | Std Dev | What it captures |
+|---|---|---|---|
+| **Wind resource** (`wind_shock`) | Normal(1.0, 0.10) | ±10% | Inter-annual wind speed variability, turbine degradation, wake losses |
+| **CAPEX** (`capex_shock`) | Normal(1.0, 0.05) | ±5% | Construction cost overrun, equipment price fluctuation |
+| **PPA electricity price** (`ppa_shock`) | Normal(1.0, 0.05) | ±5% | Revenue uncertainty from contract renegotiation or market price changes |
+
+*Each run applies independently sampled multipliers to the optimal configuration and re-solves dispatch to compute Payback, IRR, and NPV.*
+            """
+        )
         if st.button("🎲 Run 50 Monte Carlo simulations on optimal config"):
             mc_results = []
             progress   = st.progress(0)
             best_conf  = st.session_state['best_config']
 
             for i in range(50):
+                # --- Perturbed uncertain parameters ---
+                # Wind resource multiplier: ±10% std, captures inter-annual variability
                 wind_shock  = np.random.normal(1.0, 0.10)
+                # CAPEX multiplier: ±5% std, captures construction cost uncertainty
                 capex_shock = np.random.normal(1.0, 0.05)
+                # PPA price multiplier: ±5% std, captures revenue price uncertainty
                 ppa_shock   = np.random.normal(1.0, 0.05)
 
                 mc_capex, _, _, _, _ = optimizer.get_capex(
